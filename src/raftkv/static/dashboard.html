@@ -902,6 +902,14 @@ function infraDetails(addr, s) {
 function nodeActions(addr, s) {
   const acts = el("div", "node-actions");
 
+  // A learner's one interesting action is becoming a voter, so it leads.
+  if (s.learner) {
+    const promote = el("button", "primary", "promote to voter");
+    promote.type = "button";
+    promote.addEventListener("click", () => promote_(s.node_id));
+    acts.append(promote);
+  }
+
   const kill = el("button", "danger", "kill");
   kill.type = "button";
   kill.addEventListener("click", () => admin(addr, "crash"));
@@ -1108,6 +1116,28 @@ async function admin(addr, action) {
     if (!r.ok) return setStatus(`error ${r.status} from ${addr}`, "err");
     setStatus(`${addr} ${done}`, action === "recover" ? "ok" : "err");
   } catch (e) { setStatus(`${ing} ${addr} failed: ${e}`, "err"); }
+}
+
+// Promote a learner to a voting member. Goes to the LEADER: the configuration change
+// is a log entry, so only the leader can start one.
+async function promote_(nodeId) {
+  const leader = leaderAddr();
+  if (!leader) return setStatus("no leader visible", "err");
+  setStatus(`promoting ${nodeId} via ${leader}...`);
+  try {
+    const r = await fetch(`http://${leader}/admin/promote`, {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({node_id: nodeId}),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // 409 is a precondition, not a bad request: wait a beat and press again.
+      return setStatus(`${r.status}: ${body.detail ?? "promotion refused"}`, "err");
+    }
+    setStatus(`joint: ${body.old_voters?.length} old + ${body.new_voters?.length} new,`
+      + ` both majorities required`, "ok");
+  } catch (e) { setStatus(`promote failed: ${e}`, "err"); }
 }
 
 // A partition is not a crash: the node stays up and keeps accepting writes it can

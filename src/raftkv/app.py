@@ -37,6 +37,10 @@ class AddLearner(BaseModel):
     addr: str = Field(min_length=3, max_length=255, pattern=r"^[A-Za-z0-9.\-]+:\d{1,5}$")
 
 
+class Promote(BaseModel):
+    node_id: str = Field(min_length=1, max_length=64)
+
+
 class Partition(BaseModel):
     """Replace semantics: the full set of peers this node cannot talk to. []=healed."""
 
@@ -168,6 +172,27 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             log_event(logger, "admin_partition", node=cfg.node_id, blocked=sorted(node.blocked))
             return {"ok": True, "node": cfg.node_id, "blocked": sorted(node.blocked)}
+
+        @app.post("/admin/promote")
+        async def admin_promote(body: Promote) -> dict:
+            """Promote a learner to a voting member via joint consensus (§6).
+
+            Leader-only. 409 means a precondition is unmet -- a change already in
+            flight, the previous one uncommitted, or this leader has not yet committed
+            an entry from its own term -- and every one of those is a reason to wait
+            and retry, not an error in the request."""
+            refuse_if_crashed()
+            try:
+                node.promote_learner(body.node_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {
+                "ok": True,
+                "promoting": body.node_id,
+                "joint": True,
+                "old_voters": sorted(node.config.old_voters),
+                "new_voters": sorted(node.config.voters),
+            }
 
         @app.post("/admin/add-learner")
         async def admin_add_learner(body: AddLearner) -> dict:

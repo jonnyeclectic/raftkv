@@ -111,9 +111,28 @@ class RaftNode:
 
     @property
     def quorum(self) -> int:
-        """Majority of the CURRENT voter set, which is a view over the log rather
-        than the set this process was started with."""
+        """Majority of the CURRENT voter set. During a joint phase this is C-new's
+        majority; agreement additionally needs C-old's, which _has_agreement() checks."""
         return len(self.config.voters) // 2 + 1
+
+    @staticmethod
+    def _is_majority(voters: dict[str, str], acked: set[str]) -> bool:
+        """An EMPTY voter set is vacuously satisfied. That is what lets the non-joint
+        case fall out of the same code path instead of needing a branch."""
+        if not voters:
+            return True
+        return len(acked & voters.keys()) >= len(voters) // 2 + 1
+
+    def _has_agreement(self, acked: set[str]) -> bool:
+        """§6: during a joint configuration, agreement — for elections AND for entry
+        commitment — requires SEPARATE majorities of both the old and the new
+        configuration. Never the majority of their union: a union majority can be
+        satisfied entirely by C-new members, which is precisely the two-disjoint-
+        majorities failure that Figure 10 exists to rule out."""
+        if not self.config.voters:
+            return False  # belonging to no configuration is not the same as agreement
+        return (self._is_majority(self.config.voters, acked)
+                and self._is_majority(self.config.old_voters, acked))
 
     # ---- helpers -----------------------------------------------------------
     def _log(self, event: str, **ctx: object) -> None:
@@ -238,26 +257,27 @@ class RaftNode:
                 self.metrics.rpc_failures += 1
                 return None
 
-
-        votes = 1  # our own
-        if votes >= self.quorum:  # single-node cluster elects itself instantly
+        # A SET of granters, not a counter: during a joint configuration the same votes
+        # must be tallied against two rosters independently, and a bare count cannot be.
+        granted = {self.cfg.node_id}  # our own; ignored if we are not a voter
+        if self._has_agreement(granted):  # single-node cluster elects itself instantly
             self._become_leader()
             return
-        voters = set(self.config.voters) - {self.cfg.node_id}
+        voters = {*self.config.voters, *self.config.old_voters} - {self.cfg.node_id}
         pending = [asyncio.create_task(ask(p)) for p in sorted(voters)]
         try:
             for future in asyncio.as_completed(pending):
                 answer = await future
                 if answer is None:
                     continue
-                _, resp = answer
+                peer_id, resp = answer
                 self._observe_term(resp.term)
                 # Stale-reply guard: if the world moved while we awaited, stop.
                 if self.role is not Role.CANDIDATE or self.current_term != term_when_started:
                     return
                 if resp.vote_granted:
-                    votes += 1
-                    if votes >= self.quorum:
+                    granted.add(peer_id)
+                    if self._has_agreement(granted):
                         self._become_leader()
                         return
         finally:
@@ -284,6 +304,93 @@ class RaftNode:
         self._advance_commit_index()
         self._replicate_now.set()
         return index
+
+    def _reject_unless_ready_to_reconfigure(self) -> None:
+        """The four preconditions for appending a configuration entry.
+
+        Each one is a real failure if skipped, not defensive coding: a non-leader
+        cannot append at all; a second change while one is in flight produces
+        overlapping configurations; an uncommitted previous change means the current
+        one would build on a configuration that can still be truncated; and a leader
+        that has not yet committed an entry from its own term cannot tell whether an
+        inherited configuration entry is committed (the post-publication erratum to
+        thesis §4.1)."""
+        if self.role is not Role.LEADER:
+            raise NotLeaderError(self.leader_id)
+        if self.config.joint:
+            raise ValueError("a configuration change is already in flight")
+        # Gate on the TERM at commit_index rather than on a remembered no-op index:
+        # it is the property §5.4.2 actually needs, and it stays true across anything
+        # that shifts indices underneath us. Checked before the per-change gate below
+        # because it is about this leader's freshness, not about any one change.
+        if self.storage.term_at(self.commit_index) != self.current_term:
+            raise ValueError("leader has not yet committed an entry from its own term")
+        found = self.storage.last_config()
+        if found is not None and found[0] > self.commit_index:
+            raise ValueError("the previous configuration change is not committed yet")
+
+    def promote_learner(self, peer_id: str) -> None:
+        """Promote a learner to a voting member via joint consensus (§6).
+
+        Appends C-old,new: both voter sets in one entry. From the moment it is
+        APPENDED — not committed — every decision on this node needs a majority of
+        each set, so there is no instant at which the old and new configurations could
+        elect separate leaders. `_maybe_leave_joint` appends C-new once this commits.
+
+        One server at a time. The overlap arithmetic is the safety argument: adding to
+        an n-server cluster gives |maj(C_old)| + |maj(C_new)| = n + 2 over a union of
+        n + 1, so at least one server is in both majorities. Adding two at once (3->5)
+        gives 2 + 3 - 5 = 0 and that guarantee disappears."""
+        self._reject_unless_ready_to_reconfigure()
+        if peer_id not in self.config.learners:
+            raise ValueError(f"{peer_id} is not a learner of {self.cfg.node_id}")
+        # CATCH-UP GATE (thesis §4.2.1). A learner is not counted, so its lag costs
+        # nothing; the instant it becomes a voter that same lag is subtracted from the
+        # cluster's fault tolerance, because every commit now needs a majority that
+        # includes nodes able to ack. Promote one that is 10k entries behind and the
+        # cluster stops committing until it finishes -- availability lost by an
+        # administrative action that looked instantaneous.
+        #
+        # Held to the COMMITTED prefix rather than the paper's round-timing heuristic:
+        # this is the property that actually bounds the stall (what remains is the
+        # uncommitted tail, which is bounded by in-flight writes), and unlike a timing
+        # measurement it is exact and reproducible. `behind` goes back to the caller so
+        # a 409 can say how far, which turns "denied" into "wait".
+        behind = self.commit_index - self.match_index.get(peer_id, 0)
+        if behind > 0:
+            raise ValueError(
+                f"{peer_id} is {behind} committed entries behind; promoting it now "
+                f"would stall commitment until it catches up"
+            )
+        old = dict(self.config.voters)
+        new = {**old, peer_id: self.config.learners[peer_id]}
+        # Belt and braces: joint consensus is what makes ANY change safe, but holding
+        # to one voter at a time means a bug in the joint predicate degrades to
+        # single-server safety (guaranteed overlap) rather than to split brain.
+        if len(set(old) ^ set(new)) != 1:
+            raise ValueError("membership changes must add or remove exactly one voter")
+        remaining = {k: v for k, v in self.config.learners.items() if k != peer_id}
+        joint = ClusterConfig(voters=new, old_voters=old, learners=remaining)
+        self.next_index.setdefault(peer_id, self.storage.last_log_index() + 1)
+        self.match_index.setdefault(peer_id, 0)
+        self._leader_append(joint)
+        self._log("config_joint", peer=peer_id,
+                  old_voters=sorted(old), new_voters=sorted(new))
+
+    def _maybe_leave_joint(self) -> None:
+        """Once C-old,new commits, append C-new. That commit is the ONLY trigger.
+
+        Leaving early would drop C-old's majority requirement while C-old servers may
+        still be operating under it; leaving late simply stalls the transition."""
+        if self.role is not Role.LEADER or not self.config.joint:
+            return
+        found = self.storage.last_config()
+        if found is None or found[0] > self.commit_index:
+            return  # the joint entry is not committed yet
+        final = ClusterConfig(voters=dict(self.config.voters),
+                              learners=dict(self.config.learners))
+        self._leader_append(final)
+        self._log("config_committed", voters=sorted(final.voters), quorum=self.quorum)
 
     def add_learner(self, peer_id: str, addr: str) -> None:
         """Attach a non-voting member, as a configuration entry in the log.
@@ -371,14 +478,16 @@ class RaftNode:
         for candidate_index in range(self.storage.last_log_index(), self.commit_index, -1):
             if self.storage.term_at(candidate_index) != self.current_term:
                 break  # terms only shrink going backwards; nothing below qualifies
-            # VOTERS only. A learner is replicated to and must never be counted, or
-            # a majority-of-four commits on three acks and one of them cannot vote.
-            acked = 1 + sum(1 for p, m in self.match_index.items()
-                            if m >= candidate_index and p in self.config.voters)
-            if acked >= self.quorum:
+            # Who has it: us (we appended it) plus every peer whose matchIndex reaches
+            # it. _has_agreement then tests BOTH voter halves separately.
+            acked = {self.cfg.node_id} | {
+                p for p, m in self.match_index.items() if m >= candidate_index
+            }
+            if self._has_agreement(acked):
                 self.commit_index = candidate_index
                 self._log("commit_advanced", commit_index=candidate_index)
                 self._apply_ready.set()
+                self._maybe_leave_joint()
                 break
 
     # ---- client path -------------------------------------------------------
