@@ -1,0 +1,22 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { python-version: "3.14" }
+      - run: uv sync --all-extras
+      - run: uv run ruff check .
+      - run: uv run pytest
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --wait --build
+      - run: ./scripts/smoke.sh
+      - if: always()
+        run: docker compose down --volumes
