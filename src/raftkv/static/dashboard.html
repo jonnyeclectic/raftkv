@@ -320,6 +320,9 @@
           <button id="setbtn" type="button" class="primary">set on leader</button>
           <button id="delbtn" type="button">delete</button>
         </div>
+        <div class="ctl">
+          <button id="healbtn" type="button">heal all links</button>
+        </div>
         <div class="ctl"><span id="status"></span></div>
       </div>
     </section>
@@ -678,6 +681,14 @@ function nodeCard(addr) {
     head.append(el("b", "", addr), el("span", "role", "unreachable"));
     card.append(head);
     card.append(el("div", "label", "no response to /state"));
+    // Offered even when the node is genuinely dead: the request simply fails, and
+    // that failure answers "simulated crash, or real one?"
+    const acts = el("div", "node-actions");
+    const revive = el("button", "", "revive");
+    revive.type = "button";
+    revive.addEventListener("click", () => admin(addr, "recover"));
+    acts.append(revive);
+    card.append(acts);
     return card;
   }
 
@@ -698,6 +709,7 @@ function nodeCard(addr) {
 
   // Infrastructure and metrics are reference, not headline: collapsed by default.
   card.append(infraDetails(addr, s));
+  card.append(nodeActions(addr, s));
   return card;
 }
 
@@ -831,6 +843,21 @@ function infraDetails(addr, s) {
     row("rpc failures", s.metrics.rpc_failures),
   ]));
   return wrap;
+}
+
+function nodeActions(addr, s) {
+  const acts = el("div", "node-actions");
+
+  const kill = el("button", "danger", "kill");
+  kill.type = "button";
+  kill.addEventListener("click", () => admin(addr, "crash"));
+
+  const cut = el("button", "cut", s.blocked?.length ? "heal" : "cut links");
+  cut.type = "button";
+  cut.addEventListener("click", () => togglePartition(addr, s));
+
+  acts.append(kill, cut);
+  return acts;
 }
 
 function renderNodes() {
@@ -986,6 +1013,52 @@ async function removeKey() {
 // Failure injection from the browser -- no shell, no docker CLI, no kubectl. The node
 // keeps its process alive only so it can be revived; it refuses every RPC, so its
 // peers experience an ordinary crash and elect around it.
+const ADMIN_VERB = {crash: ["killing", "killed"], recover: ["reviving", "revived"],
+                    reset: ["wiping", "wiped back to first boot"]};
+
+async function admin(addr, action) {
+  const [ing, done] = ADMIN_VERB[action] ?? [action, action];
+  setStatus(`${ing} ${addr}...`);
+  try {
+    const r = await fetch(`http://${addr}/admin/${action}`, {method: "POST"});
+    if (!r.ok) return setStatus(`error ${r.status} from ${addr}`, "err");
+    setStatus(`${addr} ${done}`, action === "recover" ? "ok" : "err");
+  } catch (e) { setStatus(`${ing} ${addr} failed: ${e}`, "err"); }
+}
+
+// A partition is not a crash: the node stays up and keeps accepting writes it can
+// never commit. Cutting every link at once is the case worth exercising.
+async function togglePartition(addr, s) {
+  const healing = (s.blocked?.length ?? 0) > 0;
+  const peers = healing ? [] : [...Object.keys(s.peers ?? {}), ...Object.keys(s.learners ?? {})];
+  setStatus(`${healing ? "healing" : "cutting"} ${s.node_id}...`);
+  try {
+    const r = await fetch(`http://${addr}/admin/partition`, {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({peers}),
+    });
+    if (!r.ok) return setStatus(`error ${r.status} from ${addr}`, "err");
+    setStatus(healing ? `${s.node_id} rejoined` : `${s.node_id} cut from ${peers.length} peers`,
+              healing ? "ok" : "err");
+  } catch (e) { setStatus(`partition failed: ${e}`, "err"); }
+}
+
+async function healAll() {
+  setStatus("healing every link...");
+  const results = await Promise.all(NODES.map(async addr => {
+    try {
+      const r = await fetch(`http://${addr}/admin/partition`, {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({peers: []}),
+      });
+      return r.ok;
+    } catch { return false; }
+  }));
+  const ok = results.filter(Boolean).length;
+  setStatus(`healed ${ok}/${NODES.length} nodes`, ok === NODES.length ? "ok" : "err");
+}
 
 /* ================= loops ================= */
 
@@ -1003,6 +1076,7 @@ function frame(ts) {
 
 document.getElementById("setbtn")?.addEventListener("click", write);
 document.getElementById("delbtn")?.addEventListener("click", removeKey);
+document.getElementById("healbtn")?.addEventListener("click", healAll);
 for (const id of ["key", "value"]) {
   document.getElementById(id)?.addEventListener("keydown", e => {
     if (e.key === "Enter") { e.preventDefault(); write(); }

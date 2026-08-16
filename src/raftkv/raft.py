@@ -49,6 +49,8 @@ class RaftNode:
         self.last_applied = last_applied
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
+        self.crashed = False                    # simulated failure; see crash()
+        self.blocked: set[str] = set()          # simulated partition; see set_blocked()
         self.metrics = Metrics()
         self._last_reset = time.monotonic()
         self._election_timeout = random.uniform(*cfg.election_timeout_range)
@@ -166,6 +168,9 @@ class RaftNode:
         self._log("election_started")
 
         async def ask(peer_id: str) -> RequestVoteResponse | None:
+            if peer_id in self.blocked:  # partitioned link: same shape as unreachable
+                self.metrics.rpc_failures += 1
+                return None
             try:
                 return await self.transport.request_vote(peer_id, req)
             except TransportError:
@@ -206,6 +211,9 @@ class RaftNode:
 
     # ---- leader replication ------------------------------------------------
     async def _append_to_peer(self, peer_id: str, term_when_sent: int) -> None:
+        if peer_id in self.blocked:  # partitioned link: same shape as unreachable
+            self.metrics.rpc_failures += 1
+            return
         prev_index = self.next_index[peer_id] - 1
         prev_term = self.storage.term_at(prev_index)
         if prev_term is None:  # our log shrank under this nextIndex (deposed+truncated)
@@ -342,6 +350,69 @@ class RaftNode:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
 
+    # ---- simulated failure (demo affordance, see NodeConfig.admin_enabled) --
+    def set_blocked(self, peers: list[str]) -> None:
+        """Cut this node's links to the named peers, in BOTH directions: outbound
+        RPCs are skipped here, inbound ones are refused by the app layer. Replace
+        semantics, so healing is set_blocked([]).
+
+        A partition is not a crash, and the difference is the whole point: a
+        partitioned leader stays up, keeps accepting writes, and cannot commit any
+        of them, because commit needs a majority it can no longer reach. Blocking
+        counts as an rpc failure rather than an error, which is what an unreachable
+        peer already looks like from in here."""
+        unknown = [p for p in peers if p not in self.cfg.peers]
+        if unknown:
+            raise ValueError(f"not peers of {self.cfg.node_id}: {', '.join(sorted(unknown))}")
+        self.blocked = set(peers)
+        self._log("partition_set", blocked=sorted(self.blocked))
+
+    async def crash(self) -> None:
+        """Play dead without dying: stop every background task and let the app refuse
+        RPCs, so peers observe a node that has gone away. The process survives only so
+        that /admin/recover stays reachable — nothing about the Raft state machine is
+        special-cased for this.
+
+        Volatile state is dropped exactly as a real crash drops it. Durable state
+        (term, vote, log, applied KV) stays on disk untouched, which is the point:
+        recover() proves persistence rather than asserting it. Metrics are kept
+        deliberately — they are observability, not Raft state, and the election history
+        is the interesting part of the story afterwards."""
+        if self.crashed:
+            return
+        self.crashed = True
+        await self.stop()
+        self.role = Role.FOLLOWER
+        self.leader_id = None
+        self.next_index = {}
+        self.match_index = {}
+        # in-flight writes die with the node; TimeoutError is already the 504 path
+        for waiter in self._waiters.values():
+            if not waiter.done():
+                waiter.set_exception(TimeoutError("node crashed before commit"))
+        self._waiters = {}
+        self._log("crashed")
+
+    def recover(self) -> None:
+        """Come back the way a restarted process would: volatile state from zero,
+        durable state re-read from SQLite. The node rejoins as a follower and the
+        leader repairs its log through the normal nextIndex walk."""
+        if not self.crashed:
+            return
+        term, voted_for, last_applied = self.storage.load()
+        self.current_term = term
+        self.voted_for = voted_for
+        self.role = Role.FOLLOWER
+        self.leader_id = None
+        self.commit_index = last_applied
+        self.last_applied = last_applied
+        self._replicate_now = asyncio.Event()
+        self._apply_ready = asyncio.Event()
+        self._reset_election_timer()
+        self.crashed = False
+        self.start()
+        self._log("recovered")
+
     # ---- introspection -----------------------------------------------------
     def state(self) -> NodeState:
         last_term, last_index = self._last_log_position()
@@ -351,5 +422,5 @@ class RaftNode:
             log_length=last_index, last_log_term=last_term,
             commit_index=self.commit_index, last_applied=self.last_applied,
             kv=self.storage.kv_all(), peers=dict(self.cfg.peers),
-            metrics=self.metrics,
+            blocked=sorted(self.blocked), metrics=self.metrics,
         )
