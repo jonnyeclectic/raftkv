@@ -94,3 +94,42 @@ async def test_submit_rejects_non_leader(make_node):
         await node.submit(Command(op="set", key="k", value="v", request_id="r"))
 
 
+async def test_submit_commits_and_applies_on_single_node(make_node):
+    node = make_node(peer_ids=())
+    await node._start_election()
+    node.start()
+    try:
+        await node.submit(Command(op="set", key="temp", value="72", request_id="r1"))
+        assert node.storage.kv_get("temp") == "72"
+        assert node.last_applied == 1
+        assert node.commit_index == 1  # one voter, so appending is committing
+    finally:
+        await node.stop()
+
+
+async def test_background_task_death_is_logged(make_node):
+    """A loop that dies silently would degrade the node in production with no signal.
+    (Attach a handler directly to the raftkv.raft logger rather than using caplog:
+    setup_logging sets propagate=False on 'raftkv', so records never reach the
+    root logger caplog listens on once any earlier test has initialized logging.)"""
+    import asyncio
+    import logging
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    raft_logger = logging.getLogger("raftkv.raft")
+    raft_logger.addHandler(handler)
+    try:
+        node = make_node(peer_ids=())
+
+        async def boom():
+            raise RuntimeError("kaput")
+
+        task = asyncio.create_task(boom(), name="boom")
+        task.add_done_callback(node._on_task_death)
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)  # let the done-callback run
+        assert any("background task died" in r.getMessage() for r in records)
+    finally:
+        raft_logger.removeHandler(handler)

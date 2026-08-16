@@ -4,6 +4,7 @@ lock-ordering bugs the Students' Guide catalogues. Async methods re-validate sta
 after every await."""
 
 import asyncio
+import contextlib
 import logging
 import random
 import time
@@ -54,6 +55,7 @@ class RaftNode:
         self._replicate_now = asyncio.Event()   # submit() nudges the replication loop
         self._apply_ready = asyncio.Event()     # commit-index advances wake the applier
         self._waiters: dict[int, asyncio.Future[LogEntry]] = {}  # submits awaiting apply
+        self._tasks: list[asyncio.Task] = []
 
     @property
     def quorum(self) -> int:
@@ -270,6 +272,75 @@ class RaftNode:
         # index with a different entry. Trust the request_id, not the index.
         if applied.command.request_id != cmd.request_id:
             raise NotLeaderError(self.leader_id)
+
+    # ---- background tasks --------------------------------------------------
+    async def _election_timer_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.cfg.tick_interval)
+            if self.role is Role.LEADER:
+                continue
+            if time.monotonic() - self._last_reset >= self._election_timeout:
+                await self._start_election()  # also re-fires for a stuck candidate
+
+    async def _replication_loop(self) -> None:
+        while True:
+            if self.role is not Role.LEADER:
+                await asyncio.sleep(self.cfg.tick_interval)
+                continue
+            round_started = time.monotonic()
+            term_when_sent = self.current_term
+            await asyncio.gather(
+                *(self._append_to_peer(p, term_when_sent) for p in sorted(self.cfg.peers))
+            )
+            # Heartbeat cadence minus time already spent this round — a slow peer must
+            # not stretch the gap toward election_timeout.
+            remaining = max(
+                0.0, self.cfg.heartbeat_interval - (time.monotonic() - round_started)
+            )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._replicate_now.wait(), timeout=remaining)
+            self._replicate_now.clear()
+
+    async def _apply_loop(self) -> None:
+        """THE single applier (Students' Guide): one task applies, strictly in order."""
+        while True:
+            await self._apply_ready.wait()
+            self._apply_ready.clear()
+            while self.last_applied < self.commit_index:
+                index = self.last_applied + 1
+                applied_entry = self.storage.entry(index)
+                assert applied_entry is not None  # committed implies present
+                self.storage.apply(index, applied_entry.command)  # atomic w/ last_applied
+                self._log("applied", index=index, key=applied_entry.command.key)
+                self.last_applied = index
+                waiter = self._waiters.get(index)
+                if waiter is not None and not waiter.done():
+                    waiter.set_result(applied_entry)
+
+    def start(self) -> None:
+        self._tasks = [
+            asyncio.create_task(coro(), name=f"{self.cfg.node_id}:{coro.__name__}")
+            for coro in (self._election_timer_loop, self._replication_loop, self._apply_loop)
+        ]
+        for task in self._tasks:
+            # a silently-dead loop degrades the node with zero signal — make it loud
+            task.add_done_callback(self._on_task_death)
+
+    def _on_task_death(self, task: asyncio.Task) -> None:
+        if task.cancelled() or task.exception() is None:
+            return
+        logger.error(
+            "background task died",
+            exc_info=task.exception(),
+            extra={"ctx": {"event": "task_died", "node": self.cfg.node_id,
+                           "task": task.get_name()}},
+        )
+
+    async def stop(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
 
     # ---- introspection -----------------------------------------------------
     def state(self) -> NodeState:
