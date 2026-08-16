@@ -143,6 +143,15 @@ def test_dashboard_javascript_parses(client):
     assert result.returncode == 0, result.stderr
 
 
+def test_dashboard_exposes_membership_and_reset_controls(client):
+    page = client.get("/").text
+    assert "/admin/promote" in page and "function promote_(" in page
+    assert 'id="resetbtn"' in page and "function resetAll(" in page
+    assert "promote to voter" in page  # offered on learner cards
+    # the joint phase must be shown as TWO requirements, never averaged into one
+    assert "old AND" in page.replace("\n", " ") or "old`" in page
+    assert "JOINT" in page
+
 
 
 def test_dashboard_caps_the_state_machine_list_instead_of_growing_the_card(client):

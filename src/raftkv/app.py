@@ -4,6 +4,7 @@ Run: uvicorn --factory raftkv.app:create_app (config comes from RAFT_* env vars)
 import logging
 from contextlib import asynccontextmanager
 from importlib import resources
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -159,6 +160,22 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
             node.recover()
             log_event(logger, "admin_recover", node=cfg.node_id)
             return {"ok": True, "node": cfg.node_id, "crashed": False}
+
+        @app.post("/admin/reset")
+        async def admin_reset(membership: Literal["keep", "bootstrap"] = "keep") -> dict:
+            """Destroy this node's durable state and restart it. Deliberately removes
+            the term and vote that Fig. 2 requires to survive a reboot -- see
+            RaftNode.reset(). Demo control; RAFT_ADMIN_ENABLED=0 removes it.
+
+            `membership=keep` (the default) preserves the configuration, because
+            reverting it hands this node the voter set it BOOTED with -- a strict
+            subset of the real one after any growth, and therefore a second quorum.
+            `membership=bootstrap` opts into that revert and is sound only when sent
+            to every node at once, which is why the dashboard only ever does that."""
+            await node.reset(keep_membership=membership == "keep")
+            log_event(logger, "admin_reset", node=cfg.node_id, membership=membership)
+            return {"ok": True, "node": cfg.node_id, "reset": True,
+                    "membership": membership}
 
         @app.post("/admin/partition")
         async def admin_partition(body: Partition) -> dict:

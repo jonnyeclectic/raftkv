@@ -637,6 +637,66 @@ class RaftNode:
         self._waiters = {}
         self._log("crashed")
 
+    async def reset(self, *, keep_membership: bool = True) -> None:
+        """Wipe this node back to an empty log: stop, destroy durable state, restart.
+
+        Unlike crash()/recover(), which prove persistence, this destroys it. A node
+        reset alone rejoins empty and is refilled by the leader through the ordinary
+        nextIndex walk; resetting every node clears the cluster. Resetting ONE node
+        mid-term also removes the vote it already cast, which is precisely the
+        double-vote that Fig. 2's durability requirement exists to prevent -- worth
+        reproducing on purpose once.
+
+        MEMBERSHIP SURVIVES THE WIPE, and must. An empty log sends _reload_config()
+        to _bootstrap_config(), which is the set this PROCESS was booted with -- and
+        after any growth that set is a strict subset of the real one. A 5-voter
+        cluster whose first three nodes were booted naming only each other therefore
+        turns two resets into a 3-voter configuration with quorum 2: those two nodes
+        elect a leader among themselves, commit a write, acknowledge it to the client,
+        and lose it when the majority side repairs them. Two leaders and a lost
+        acknowledged write, from an operation documented as safe on one node.
+
+        So the last configuration is re-seeded as an index-1 entry at TERM 0. It is a
+        real log entry because membership is a view over the log and never a cache
+        beside it; term 0 because every real leader's index-1 entry has a term of at
+        least 1, so the ordinary consistency check conflicts with this one and the
+        repair walk truncates it away without a special case.
+
+        `keep_membership=False` is the deliberate exception: it reverts to the startup
+        configuration, which is only sound applied to EVERY node at once (nobody is
+        left holding the superseded set). That is the dashboard's "reset all nodes",
+        and it is the same restriction etcd puts on `snapshot restore`, which likewise
+        rewrites membership and likewise requires the cluster to be down."""
+        await self.stop()
+        # Read BEFORE the wipe; there is nothing to read after it.
+        found = self.storage.last_config() if keep_membership else None
+        self.storage.wipe()
+        if found is not None:
+            self.storage.append([LogEntry(term=0, command=found[1])])
+        term, voted_for, last_applied = self.storage.load()
+        self.current_term = term
+        self.voted_for = voted_for
+        self.role = Role.FOLLOWER
+        self.leader_id = None
+        self.commit_index = last_applied
+        self.last_applied = last_applied
+        self.next_index = {}
+        self.match_index = {}
+        self.blocked = set()
+        self.metrics = Metrics()
+        self._noop_index = 0
+        self._reload_config()  # picks up the re-seeded entry, or bootstraps if dropped
+        self.crashed = False
+        self._replicate_now = asyncio.Event()
+        self._apply_ready = asyncio.Event()
+        self._reset_election_timer()
+        for waiter in self._waiters.values():
+            if not waiter.done():
+                waiter.set_exception(TimeoutError("node was reset before commit"))
+        self._waiters = {}
+        self.start()
+        self._log("reset")
+
     def recover(self) -> None:
         """Come back the way a restarted process would: volatile state from zero,
         durable state re-read from SQLite. The node rejoins as a follower and the

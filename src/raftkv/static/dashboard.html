@@ -337,6 +337,7 @@
         </div>
         <div class="ctl">
           <button id="healbtn" type="button">heal all links</button>
+          <button id="resetbtn" type="button" class="danger">reset all nodes</button>
         </div>
         <div class="ctl">
           <span class="label">learners do not move quorum · per-node reset keeps
@@ -918,7 +919,13 @@ function nodeActions(addr, s) {
   cut.type = "button";
   cut.addEventListener("click", () => togglePartition(addr, s));
 
-  acts.append(kill, cut);
+  const wipe = el("button", "danger", "reset");
+  wipe.type = "button";
+  wipe.title = "destroy this node's term, vote, log and applied state "
+             + "(membership survives, or this node would rejoin as its own quorum)";
+  wipe.addEventListener("click", () => admin(addr, "reset"));
+
+  acts.append(kill, cut, wipe);
   return acts;
 }
 
@@ -1140,6 +1147,26 @@ async function promote_(nodeId) {
   } catch (e) { setStatus(`promote failed: ${e}`, "err"); }
 }
 
+// Every node, wiped. The intended way to start the cluster over without a terminal.
+// The ONE caller allowed to send membership=bootstrap, and the reason the flag exists
+// rather than being the default: reverting a single node to its startup voter set
+// hands it a subset of the real configuration, which is a second quorum. Sent to every
+// node at once nobody is left holding the superseded set, so the cluster simply
+// re-forms at its original size -- which is what "start over" means.
+async function resetAll() {
+  setStatus("wiping every node back to the startup configuration...");
+  const done = await Promise.all(NODES.map(async addr => {
+    try {
+      return (await fetch(`http://${addr}/admin/reset?membership=bootstrap`,
+                          {method: "POST"})).ok;
+    } catch { return false; }
+  }));
+  const ok = done.filter(Boolean).length;
+  setStatus(`wiped ${ok}/${NODES.length} nodes: logs, terms, votes, applied state`
+            + " and membership",
+            ok === NODES.length ? "ok" : "err");
+}
+
 // A partition is not a crash: the node stays up and keeps accepting writes it can
 // never commit. Cutting every link at once is the case worth exercising.
 async function togglePartition(addr, s) {
@@ -1236,6 +1263,7 @@ document.getElementById("setbtn")?.addEventListener("click", write);
 document.getElementById("delbtn")?.addEventListener("click", removeKey);
 document.getElementById("addbtn")?.addEventListener("click", addNode);
 document.getElementById("healbtn")?.addEventListener("click", healAll);
+document.getElementById("resetbtn")?.addEventListener("click", resetAll);
 for (const id of ["key", "value"]) {
   document.getElementById(id)?.addEventListener("keydown", e => {
     if (e.key === "Enter") { e.preventDefault(); write(); }
