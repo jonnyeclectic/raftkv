@@ -1,0 +1,41 @@
+services:
+  raft-node-1:
+    build: .
+    ports: ["8001:8000"]
+    environment:
+      RAFT_NODE_ID: node-1
+      RAFT_PEERS: node-2=raft-node-2:8000,node-3=raft-node-3:8000
+      # Without this a bootstrap node puts ITSELF in the configuration under an empty
+      # address. That config entry replicates, and a later-joined node inherits a voter
+      # it can never dial -- so it can never collect that vote. Set on every node, not
+      # just the learners, because every node's own address now travels in the log.
+    volumes: ["node1-data:/data", "node1-logs:/var/log/raftkv"]
+    healthcheck: &hc
+      test: ["CMD", "python", "-c",
+             "import urllib.request as u; u.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  raft-node-2:
+    build: .
+    ports: ["8002:8000"]
+    environment:
+      RAFT_NODE_ID: node-2
+      RAFT_PEERS: node-1=raft-node-1:8000,node-3=raft-node-3:8000
+    volumes: ["node2-data:/data", "node2-logs:/var/log/raftkv"]
+    healthcheck: *hc
+  raft-node-3:
+    build: .
+    ports: ["8003:8000"]
+    environment:
+      RAFT_NODE_ID: node-3
+      RAFT_PEERS: node-1=raft-node-1:8000,node-2=raft-node-2:8000
+    volumes: ["node3-data:/data", "node3-logs:/var/log/raftkv"]
+    healthcheck: *hc
+volumes:
+  node1-data: {}
+  node1-logs: {}
+  node2-data: {}
+  node2-logs: {}
+  node3-data: {}
+  node3-logs: {}

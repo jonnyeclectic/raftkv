@@ -1,0 +1,12 @@
+.venv/
+.git/
+data/
+logs/
+docs/
+tests/
+k8s/
+scripts/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+uv.lock
