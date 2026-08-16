@@ -543,14 +543,21 @@ function memberAddrs() { return NODES.filter(a => !isStaged(states[a])); }
 function stagedAddrs() { return NODES.filter(a => isStaged(states[a])); }
 /* --- end node classification ------------------------------------------------------ */
 
-/* --- leader selection --------------------------------------------------------------
-   The first node reporting itself leader wins. */
+/* --- leader selection (behaviour pinned by tests/test_dashboard_leader.py) ---------
+   HIGHEST TERM wins, never first-seen. Raft guarantees one leader PER TERM, not one
+   leader: during a partition a stale leader at term N keeps reporting role=leader
+   alongside the real one at term N+1, and both are telling the truth. Scanning in
+   address order therefore picks by node number, and a stale isolated leader wins
+   whenever it sorts first -- hijacking the header, the topology edges, and every
+   write this panel sends. See docs/FAILURE_MODES.md ("two leaders on the dashboard"). */
 
 function leaderEntry() {
+  let best = null;
   for (const [addr, s] of Object.entries(states)) {
-    if (s && s.role === "leader") return {addr, s};
+    if (!s || s.role !== "leader" || s.learner) continue;
+    if (!best || s.term > best.s.term) best = {addr, s};
   }
-  return null;
+  return best;
 }
 
 function leaderAddr() {
