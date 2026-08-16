@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
+from raftkv.build import SERVER_BUILD, ui_build
 from raftkv.config import NodeConfig
 from raftkv.flood import MAX_CONCURRENCY, MAX_TOTAL, FloodBusyError, FloodRunner
 from raftkv.logging_setup import RingBufferHandler, log_event, setup_logging
@@ -282,10 +283,19 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
         refuse_if_crashed()  # compose/k8s probes see the failure too
         return {"ok": True, "node": cfg.node_id}
 
+    @app.get("/build")
+    async def build() -> dict:
+        """Which build is this node actually running? Deliberately answers while
+        crashed, same as `/`: during an incident the version is precisely what you
+        want, and a stamp that goes dark with the node cannot report a stale one."""
+        return {"node": cfg.node_id, "server": SERVER_BUILD, "ui": ui_build()}
+
     @app.get("/", response_class=HTMLResponse)
     async def dashboard() -> str:
-        # Re-read per request rather than cached at import: the page has no build
-        # step, so a UI edit shows up on reload instead of on a restart.
-        return (resources.files("raftkv") / "static" / "dashboard.html").read_text()
+        # Stamped at serve time rather than fetched by the page. The page must report
+        # the build it IS, not the build on disk when it got round to asking -- those
+        # differ exactly when a tab has gone stale, which is the case worth catching.
+        page = (resources.files("raftkv") / "static" / "dashboard.html").read_text()
+        return page.replace("__UI_BUILD__", ui_build())
 
     return app

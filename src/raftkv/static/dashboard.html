@@ -292,6 +292,7 @@
 <header>
   <h1>raftkv</h1>
   <span class="label">replicated key-value store</span>
+  <span class="label" id="build" title="ui = this page's bytes; srv = the code this node is running"></span>
   <div id="health"></div>
 </header>
 
@@ -467,6 +468,43 @@ function byId() {
   const map = {};
   for (const [addr, s] of Object.entries(states)) if (s) map[s.node_id] = {addr, s};
   return map;
+}
+
+/* --- build stamps (behaviour pinned by tests/test_build_stamp.py) ------------------
+   PAGE_UI_BUILD is substituted by app.py at SERVE time, so it names the bytes this tab
+   is running rather than whatever is on disk by the time the page thinks to ask. The
+   two diverge exactly when a tab has gone stale -- the case worth catching, and the one
+   a page that fetched its own version would report wrongly. */
+const PAGE_UI_BUILD = "__UI_BUILD__";
+const builds = {};   // addr -> {node, server, ui} | null
+let buildTick = 0;
+
+async function pollBuild(addr) {
+  try {
+    const r = await fetch(`http://${addr}/build`, {signal: AbortSignal.timeout(900)});
+    builds[addr] = r.ok ? await r.json() : null;
+  } catch { builds[addr] = null; }
+}
+
+function buildSummary() {
+  const seen = Object.values(builds).filter(Boolean);
+  if (!seen.length) return "?";
+  // Nodes running different code behave like Raft misbehaving, and it is invisible
+  // from every other panel on this page. Name it rather than averaging it away.
+  const versions = [...new Set(seen.map(b => b.server))];
+  return versions.length === 1 ? versions[0] : `MIXED (${versions.length})`;
+}
+
+function renderBuild() {
+  const slot = document.getElementById("build");
+  if (!slot) return;
+  const own = builds[location.host];   // the node that served this page
+  const stale = !!own && own.ui !== PAGE_UI_BUILD;
+  const parts = [`ui ${PAGE_UI_BUILD}`];
+  if (own) parts.push(`srv ${own.server}`);
+  if (stale) parts.push("RELOAD");   // dashboard.html changed under this tab
+  slot.textContent = parts.join(" · ");
+  slot.style.color = stale ? "var(--candidate)" : "";
 }
 
 // Knock on the staging addresses; adopt whoever answers. Runs every tick, so a node
@@ -1474,8 +1512,13 @@ function renderFlood() {
 async function tick() {
   await discover();
   await Promise.all(NODES.map(poll));
+  // Every 10th tick (~5s): a build changes on restart or an edit, not twice a second,
+  // and this is a second request per node against a cluster already counting rpc failures.
+  if (buildTick++ % 10 === 0) await Promise.all(NODES.map(pollBuild));
+  await pollFlood();
   renderSystem();
   renderNodes();
+  renderBuild();
   renderFlood();
   await refreshLogs();
 }
