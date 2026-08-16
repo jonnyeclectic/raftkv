@@ -1,0 +1,102 @@
+from raftkv.models import Command, LogEntry, RequestVoteRequest, Role
+
+
+def vote_req(term=1, candidate="node-2", last_idx=0, last_term=0):
+    return RequestVoteRequest(
+        term=term, candidate_id=candidate, last_log_index=last_idx, last_log_term=last_term
+    )
+
+
+def entry(term: int, rid: str = "r") -> LogEntry:
+    return LogEntry(term=term, command=Command(op="set", key="k", value="v", request_id=rid))
+
+
+def test_grants_vote_to_fresh_candidate(make_node):
+    node = make_node()
+    resp = node.handle_request_vote(vote_req(term=1))
+    assert resp.vote_granted
+    assert node.voted_for == "node-2"
+    # rule 1: the grant is PERSISTED before the reply — without this line on disk,
+    # a rebooted voter double-votes and two leaders can share a term
+    assert node.storage.load()[:2] == (1, "node-2")
+
+
+def test_one_vote_per_term_but_regrant_same_candidate(make_node):
+    node = make_node()
+    assert node.handle_request_vote(vote_req(term=1, candidate="node-2")).vote_granted
+    assert not node.handle_request_vote(vote_req(term=1, candidate="node-3")).vote_granted
+    # a retried RPC from the SAME candidate is re-granted (rule 6 wording)
+    assert node.handle_request_vote(vote_req(term=1, candidate="node-2")).vote_granted
+
+
+def test_rejects_stale_term(make_node):
+    node = make_node()
+    node.current_term = 5
+    resp = node.handle_request_vote(vote_req(term=3))
+    assert not resp.vote_granted
+    assert resp.term == 5  # candidate learns the newer term
+
+
+def test_rejects_candidate_with_older_last_term(make_node):
+    node = make_node()
+    node.storage.append([entry(term=3)])
+    # candidate's log is LONGER but its last term is older -> not up-to-date (§5.4.1)
+    assert not node.handle_request_vote(vote_req(term=4, last_idx=5, last_term=2)).vote_granted
+
+
+def test_rejects_candidate_with_shorter_log_same_term(make_node):
+    node = make_node()
+    node.storage.append([entry(term=1, rid="a"), entry(term=1, rid="b")])
+    assert not node.handle_request_vote(vote_req(term=2, last_idx=1, last_term=1)).vote_granted
+
+
+def test_empty_log_candidate_never_wins_however_high_its_term(make_node):
+    """§5.4.1 compares LOGS, not terms, so no amount of term inflation lets a node
+    without the data lead the nodes that have it. It does depose the leader every time
+    though (see the term assertion), which is the disruptive-server problem."""
+    voter = make_node()
+    voter.storage.append([entry(term=6)])  # the one committed entry the peers held
+    for term in range(5, 21):
+        resp = voter.handle_request_vote(vote_req(term=term, last_idx=0, last_term=0))
+        assert not resp.vote_granted, f"empty-log candidate won a vote at term {term}"
+        assert voter.voted_for is None  # and nothing was persisted on its behalf
+        assert resp.term == term  # ...yet the voter DOES adopt the term: the disruption
+
+
+def test_higher_term_deposes_leader_and_persists(make_node):
+    node = make_node()
+    node.role = Role.LEADER
+    node.current_term = 2
+    node.voted_for = "node-1"
+    node.handle_request_vote(vote_req(term=7))
+    assert node.role is Role.FOLLOWER
+    assert node.current_term == 7
+    assert node.storage.load()[0] == 7  # rule 1: a reopened node must not double-vote
+
+
+def test_vote_grant_resets_election_timer(make_node):
+    node = make_node()
+    node._last_reset = 0.0
+    node.handle_request_vote(vote_req(term=1))
+    assert node._last_reset > 0.0
+
+
+def test_rejected_vote_does_not_reset_timer(make_node):
+    """Students' Guide bug #1: resetting on vote REQUESTS (vs grants) causes livelock."""
+    node = make_node()
+    node.current_term = 5
+    node._last_reset = 0.0
+    node.handle_request_vote(vote_req(term=3))
+    assert node._last_reset == 0.0
+
+
+def test_deposed_leader_timer_is_reset(make_node):
+    """A leader's timer is stale from its whole tenure. Without a reset on
+    step-down, an ex-leader re-elects itself within one tick after being deposed."""
+    node = make_node()
+    node.role = Role.LEADER
+    node.current_term = 2
+    node._last_reset = 0.0
+    node._observe_term(9)  # e.g. a higher term seen in an RPC response
+    assert node.role is Role.FOLLOWER
+    assert node._last_reset > 0.0
