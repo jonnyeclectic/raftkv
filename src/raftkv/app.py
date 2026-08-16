@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from raftkv.config import NodeConfig
+from raftkv.flood import MAX_CONCURRENCY, MAX_TOTAL, FloodBusyError, FloodRunner
 from raftkv.logging_setup import RingBufferHandler, log_event, setup_logging
 from raftkv.models import (
     AppendEntriesRequest,
@@ -48,17 +49,34 @@ class Partition(BaseModel):
     peers: list[str] = Field(default_factory=list, max_length=16)
 
 
+class FloodRequest(BaseModel):
+    """A load-generator run. `concurrency` is separate from `total` on purpose: the same
+    total sails through at low concurrency and collapses at high, and being able to show
+    both is the whole point of exposing the knob (see flood.py)."""
+
+    workload: Literal["distinct", "overwrite", "mixed"] = "mixed"
+    total: int = Field(default=200, ge=1, le=MAX_TOTAL)
+    concurrency: int = Field(default=50, ge=1, le=MAX_CONCURRENCY)
+
+
 def create_app(cfg: NodeConfig | None = None) -> FastAPI:
     cfg = cfg or NodeConfig.from_env()
     setup_logging(cfg)
     storage = Storage(cfg.db_path)
     transport = HttpTransport(cfg.peers, cfg.rpc_timeout)
     node = RaftNode(cfg, storage, transport)
+    # One generator per node. Constructed unconditionally so /admin/flood's handlers can
+    # close over it, but only ever reachable when cfg.admin_enabled mounts those routes.
+    flood = FloodRunner(node)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         node.start()
         yield
+        # Cancel the generator BEFORE stopping the node: a flood still in flight holds
+        # submit() futures that node.stop() would otherwise leave awaiting a commit that
+        # can never arrive, and the task would outlive the app it belongs to.
+        await flood.cancel()
         await node.stop()
         await transport.aclose()
         storage.close()
@@ -221,6 +239,33 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             return {"ok": True, "learner": body.node_id, "addr": body.addr}
+
+        @app.post("/admin/flood")
+        async def admin_flood(body: FloodRequest) -> dict:
+            """Start a mixed-workload flood on this node. Returns IMMEDIATELY.
+
+            The generator runs in the background so the dashboard can poll
+            GET /admin/flood and draw progress; a synchronous endpoint would hold the
+            connection for the whole burst and show nothing until it was already over."""
+            refuse_if_crashed()
+            try:
+                return flood.start(body.workload, body.total, body.concurrency)
+            except FloodBusyError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        @app.delete("/admin/flood")
+        async def admin_flood_cancel() -> dict:
+            """Stop a running flood. Writes already in flight settle on their own."""
+            refuse_if_crashed()
+            return await flood.cancel()
+
+        @app.get("/admin/flood")
+        async def admin_flood_status() -> dict:
+            """Live counters while running, final counters afterwards. Polled by the
+            dashboard, so it must stay cheap: it reads counters, never the log."""
+            return flood.status()
 
     # ---- observability -----------------------------------------------------
     @app.get("/state")

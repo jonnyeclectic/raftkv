@@ -153,6 +153,24 @@ def test_dashboard_exposes_membership_and_reset_controls(client):
     assert "JOINT" in page
 
 
+def test_dashboard_has_every_management_control(client):
+    """The dashboard is the operator surface: every failure and membership control has
+    to be reachable without dropping to a terminal."""
+    page = client.get("/").text
+    for control in ['id="setbtn"', 'id="delbtn"', 'id="addbtn"', 'id="healbtn"']:
+        assert control in page, control
+    assert "/admin/${action}" in page  # kill / revive post to the node itself
+    assert "/admin/partition" in page  # cut / heal links
+    assert "/admin/add-learner" in page  # join a non-voting member
+    assert "function togglePartition(" in page and "function healAll(" in page
+    # the load generator: start, stop, and the three workloads, all without a terminal
+    for control in ['id="floodbtn"', 'id="floodstopbtn"', 'id="flood-workload"',
+                    'id="flood-total"', 'id="flood-concurrency"']:
+        assert control in page, control
+    assert "/admin/flood" in page
+    for workload in ("distinct", "overwrite", "mixed"):
+        assert f'value="{workload}"' in page, workload
+
 
 def test_dashboard_caps_the_state_machine_list_instead_of_growing_the_card(client):
     """A flood puts hundreds of keys in the state machine. Unbounded, the card grows
@@ -188,6 +206,18 @@ def test_dashboard_orders_state_machine_keys_numerically(client):
     assert "function sortedKv(" in page
     assert "numeric: true" in page  # Intl.Collator, not a hand-rolled parser
 
+
+def test_dashboard_shows_flood_progress_while_it_runs(client):
+    """A flood is started by a POST that returns immediately, so every bit of progress
+    reaches the screen through polling. Without that the panel would sit blank for the
+    whole burst and then jump to a final number, hiding the cluster under load — which is
+    the part worth observing."""
+    page = client.get("/").text
+    assert "async function pollFlood(" in page
+    assert "renderFlood()" in page  # called from the 500ms tick, not only on click
+    # the bar is stacked by OUTCOME: which way the writes went is the whole finding
+    for seg in ("seg ok", "seg timeout", "seg notleader"):
+        assert seg in page, seg
 
 
 def test_dashboard_renders_topology_without_external_dependencies(client):

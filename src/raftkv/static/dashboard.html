@@ -216,6 +216,32 @@
   button.cut:hover { background: #3a2312; border-color: var(--cut); }
   :focus-visible { outline: 2px solid var(--follower); outline-offset: 2px; }
 
+  /* ---------- load generator ---------- */
+  /* Number inputs sit beside their labels rather than stretching: `writes` and `at once`
+     are read as a pair, and a full-width box makes them look like separate controls. */
+  #flood-total, #flood-concurrency { flex: 0 0 5.5rem; min-width: 5.5rem; }
+  #flood-workload { flex: 1 1 auto; }
+  .floodbar {
+    display: flex;
+    height: 6px;
+    margin-top: var(--s3);
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--line);
+  }
+  /* Colour carries meaning here and nowhere else on this page: these are the same three
+     outcomes the event feed tints, so green/amber/red read consistently across both. */
+  .floodbar .seg { width: 0; transition: width .18s linear; }
+  .floodbar .seg.ok        { background: var(--leader); }
+  .floodbar .seg.timeout   { background: var(--cut); }
+  .floodbar .seg.notleader { background: var(--down); }
+  /* Striped rather than a fourth flat colour: an unexpected error is not a fourth
+     normal outcome, and the texture reads as wrong at a glance. */
+  .floodbar .seg.failed {
+    background: repeating-linear-gradient(
+      45deg, var(--down), var(--down) 3px, var(--bg) 3px, var(--bg) 6px);
+  }
+
   .node-actions { display: flex; gap: var(--s2); margin-top: var(--s3); }
   .node-actions button { flex: 1; font-size: var(--t2); padding: var(--s1) var(--s2); }
 
@@ -344,6 +370,50 @@
             membership · reset all reverts it</span>
         </div>
         <div class="ctl"><span id="status"></span></div>
+      </div>
+    </section>
+
+    <!-- Load generator. Runs INSIDE the leader, not in this tab: a browser cannot hold
+         hundreds of requests genuinely in flight without its own connection pool
+         becoming the thing you are measuring. -->
+    <section class="panel">
+      <header>
+        <span class="label">load generator</span>
+        <span class="label" id="flood-where" style="margin-left:auto"></span>
+      </header>
+      <div class="body">
+        <div class="ctl">
+          <select id="flood-workload" title="which mix of client operations to send">
+            <option value="mixed">mixed — sets + deletes</option>
+            <option value="distinct">distinct — one key each</option>
+            <option value="overwrite">overwrite — all one key</option>
+          </select>
+        </div>
+        <div class="ctl">
+          <label class="label" for="flood-total">writes</label>
+          <input id="flood-total" type="number" min="1" max="5000" value="200"
+                 inputmode="numeric">
+          <label class="label" for="flood-concurrency">at once</label>
+          <input id="flood-concurrency" type="number" min="1" max="2000" value="50"
+                 inputmode="numeric">
+        </div>
+        <div class="ctl">
+          <button id="floodbtn" type="button" class="primary">run flood</button>
+          <button id="floodstopbtn" type="button" class="danger">stop</button>
+        </div>
+        <!-- The bar is stacked, not a single fill: which OUTCOME the writes reached is
+             the whole finding, and a monochrome progress bar would hide it. -->
+        <div id="flood-bar" class="floodbar" aria-hidden="true">
+          <span class="seg ok"></span>
+          <span class="seg timeout"></span>
+          <span class="seg notleader"></span>
+          <span class="seg failed"></span>
+        </div>
+        <div class="ctl"><span id="flood-status" class="label"></span></div>
+        <div class="ctl">
+          <span class="label">"at once" is the interesting knob: the same total commits
+            cleanly in small batches and can starve the heartbeat in one big one</span>
+        </div>
       </div>
     </section>
 
@@ -1246,11 +1316,167 @@ async function attach(addr) {
 
 /* ================= loops ================= */
 
+/* ================= load generator =================
+   The generator runs inside the LEADER (see flood.py); this panel is a remote control
+   and a progress display, nothing more. Two consequences shape the code below:
+
+   - Which node ran it matters. A flood aimed at whoever led when you pressed the button
+     keeps reporting from that node even after leadership moves, so the panel names the
+     node it is polling rather than silently following the current leader. Otherwise a
+     mid-flood election makes the counters look like they reset.
+   - The flood outlives the request that started it. POST returns immediately, so all
+     progress arrives through polling on the ordinary 500ms tick. */
+
+let floodNode = null;   // addr of the node running (or last to run) a flood
+let floodState = null;  // its most recent /admin/flood snapshot
+
+async function startFlood() {
+  const addr = leaderAddr();
+  if (!addr) { setFloodStatus("no leader — nothing to flood", "bad"); return; }
+  const total = Number(document.getElementById("flood-total")?.value);
+  const concurrency = Number(document.getElementById("flood-concurrency")?.value);
+  const workload = document.getElementById("flood-workload")?.value || "mixed";
+  // Caught here rather than at the server: a 422 renders as a validation blob, and the
+  // useful message ("between 1 and 5000") is worth saying before the round trip.
+  if (!Number.isInteger(total) || total < 1 || total > 5000) {
+    setFloodStatus("writes must be between 1 and 5000", "bad"); return;
+  }
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 2000) {
+    setFloodStatus("at-once must be between 1 and 2000", "bad"); return;
+  }
+  setFloodStatus(`starting ${workload}…`, "");
+  try {
+    const r = await fetch(`http://${addr}/admin/flood`, {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({workload, total, concurrency}),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!r.ok) {
+      // 503 means leadership moved between the poll and the click — the same honest
+      // failure the write control reports, and re-pressing after the cards resettle
+      // is the correct response rather than an automatic retry.
+      const why = r.status === 409 ? "a flood is already running"
+                : r.status === 503 ? "that node is no longer the leader"
+                : `HTTP ${r.status}`;
+      setFloodStatus(why, "bad");
+      return;
+    }
+    floodNode = addr;
+    floodState = await r.json();
+    renderFlood();
+  } catch (e) {
+    setFloodStatus(`unreachable: ${e.name}`, "bad");
+  }
+}
+
+async function stopFlood() {
+  const addr = floodNode || leaderAddr();
+  if (!addr) return;
+  try {
+    const r = await fetch(`http://${addr}/admin/flood`, {
+      method: "DELETE", signal: AbortSignal.timeout(3000),
+    });
+    if (r.ok) { floodState = await r.json(); renderFlood(); }
+  } catch { /* the poll below will re-establish the truth */ }
+}
+
+async function pollFlood() {
+  if (!floodNode) return;
+  try {
+    const r = await fetch(`http://${floodNode}/admin/flood`,
+                          {signal: AbortSignal.timeout(900)});
+    if (r.ok) floodState = await r.json();
+  } catch {
+    // A node that stops answering mid-flood is itself the finding — leave the last
+    // known counters displayed rather than blanking the panel.
+  }
+}
+
+function setFloodStatus(text, cls) {
+  const s = document.getElementById("flood-status");
+  if (!s) return;
+  s.textContent = text;
+  s.className = cls ? `label ${cls}` : "label";
+}
+
+/* --- flood summary (sliced out and run under node by tests/test_dashboard_flood.py) */
+/* Pure function on a /admin/flood snapshot: what the panel says, and how it is tinted.
+   Separated from the DOM writes so the wording — the part the operator actually reads and
+   the part most easily made wrong — can be asserted on directly. */
+function floodSummary(s) {
+  if (!s || !s.total) return null;
+  const secs = s.elapsed_ms != null ? (s.elapsed_ms / 1000).toFixed(1) : "?";
+  const parts = [`${s.done}/${s.total}`];
+  if (s.ok) parts.push(`${s.ok} committed`);
+  if (s.timeout) parts.push(`${s.timeout} timed out`);
+  if (s.not_leader) parts.push(`${s.not_leader} rejected`);
+  // `failed` is categorically different from the two above: a heavy burst is SUPPOSED
+  // to produce timeouts and rejections, and is never supposed to produce these.
+  if (s.failed) parts.push(`${s.failed} FAILED`);
+  parts.push(`${secs}s`);
+  if (s.running) return {text: `${s.workload} · ${parts.join(" · ")}`, cls: ""};
+  if (s.cancelled) return {text: `cancelled · ${parts.join(" · ")}`, cls: "warn"};
+  // Rate counts COMMITTED writes, not settled ones. Dividing `done` by elapsed time
+  // reports a burst that timed out 499 of 500 writes as "217/s", which is the exact
+  // opposite of what happened and undercuts the one thing this panel exists to show.
+  // Only meaningful once it is over, and only against time that actually elapsed —
+  // a sub-millisecond flood would divide by zero.
+  const rate = s.elapsed_ms > 0 ? Math.round(1000 * s.ok / s.elapsed_ms) : null;
+  // `!== null`, not truthiness: a collapsed burst rounds to 0/s, and 0 is the single
+  // most informative rate this panel can print. Dropping it as falsy would hide the
+  // finding at exactly the moment there is one.
+  if (rate !== null) parts.push(`${rate}/s committed`);
+  // Amber whenever anything failed: a flood that "finished" having timed out half its
+  // writes is the finding, and a green bar would bury it.
+  // `failed` is red, not amber, and says so in words: timeouts and rejections are Raft
+  // working as designed under load, while an unexpected error is a bug in this build.
+  if (s.failed) {
+    return {text: `${s.workload} done · ${parts.join(" · ")}`, cls: "bad"};
+  }
+  // A burst that ended short of its total did not finish, whatever the counters say.
+  if (s.done < s.total && !s.cancelled) {
+    return {text: `${s.workload} INCOMPLETE · ${parts.join(" · ")}`, cls: "bad"};
+  }
+  const cls = s.timeout || s.not_leader ? "warn" : "good";
+  return {text: `${s.workload} done · ${parts.join(" · ")}`, cls};
+}
+
+/* Segment widths as percentages of TOTAL, not of done: the bar fills as the flood
+   progresses and the untouched remainder stays visible as the track behind it. */
+function floodWidths(s) {
+  if (!s || !s.total) return {ok: "0%", timeout: "0%", notleader: "0%", failed: "0%"};
+  const pct = n => `${(100 * (n || 0) / s.total).toFixed(2)}%`;
+  return {ok: pct(s.ok), timeout: pct(s.timeout), notleader: pct(s.not_leader),
+          failed: pct(s.failed)};
+}
+/* --- end flood summary ------------------------------------------------------------ */
+
+function renderFlood() {
+  const where = document.getElementById("flood-where");
+  if (where) {
+    const label = states[floodNode]?.node_id || floodNode || "";
+    where.textContent = label ? `on ${label}` : "";
+  }
+
+  const bar = document.getElementById("flood-bar");
+  const widths = floodWidths(floodState);
+  if (bar) {
+    bar.querySelector(".ok").style.width = widths.ok;
+    bar.querySelector(".timeout").style.width = widths.timeout;
+    bar.querySelector(".notleader").style.width = widths.notleader;
+    bar.querySelector(".failed").style.width = widths.failed;
+  }
+  const summary = floodSummary(floodState);
+  if (summary) setFloodStatus(summary.text, summary.cls);
+}
+
 async function tick() {
   await discover();
   await Promise.all(NODES.map(poll));
   renderSystem();
   renderNodes();
+  renderFlood();
   await refreshLogs();
 }
 
@@ -1264,6 +1490,13 @@ document.getElementById("delbtn")?.addEventListener("click", removeKey);
 document.getElementById("addbtn")?.addEventListener("click", addNode);
 document.getElementById("healbtn")?.addEventListener("click", healAll);
 document.getElementById("resetbtn")?.addEventListener("click", resetAll);
+document.getElementById("floodbtn")?.addEventListener("click", startFlood);
+document.getElementById("floodstopbtn")?.addEventListener("click", stopFlood);
+for (const id of ["flood-total", "flood-concurrency"]) {
+  document.getElementById(id)?.addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); startFlood(); }
+  });
+}
 for (const id of ["key", "value"]) {
   document.getElementById(id)?.addEventListener("keydown", e => {
     if (e.key === "Enter") { e.preventDefault(); write(); }
