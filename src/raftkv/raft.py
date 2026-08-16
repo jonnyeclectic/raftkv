@@ -1,7 +1,10 @@
 """The Raft node. Rule methods are SYNCHRONOUS — under asyncio's single event loop
 they run start-to-finish with no interleaving, which is this design's answer to the
 lock-ordering bugs the Students' Guide catalogues. Async methods re-validate state
-after every await."""
+after every await.
+
+Review checklist for any change in this file: "the seven correctness rules" in
+docs/RAFT.md."""
 
 import asyncio
 import contextlib
@@ -14,10 +17,12 @@ from raftkv.logging_setup import log_event
 from raftkv.models import (
     AppendEntriesRequest,
     AppendEntriesResponse,
+    ClusterConfig,
     Command,
     LogEntry,
     Metrics,
     NodeState,
+    NoOp,
     RequestVoteRequest,
     RequestVoteResponse,
     Role,
@@ -49,19 +54,66 @@ class RaftNode:
         self.last_applied = last_applied
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
-        self.crashed = False                    # simulated failure; see crash()
-        self.blocked: set[str] = set()          # simulated partition; see set_blocked()
         self.metrics = Metrics()
+        # Membership is DERIVED FROM THE LOG (§6), never cached independently of it.
+        # _reload_config() runs after every log mutation, which is what makes a
+        # truncated configuration entry revert the configuration for free.
+        self.config = ClusterConfig()
+        self._noop_index = 0  # index of this term's no-op; gates membership changes
         self._last_reset = time.monotonic()
         self._election_timeout = random.uniform(*cfg.election_timeout_range)
         self._replicate_now = asyncio.Event()   # submit() nudges the replication loop
         self._apply_ready = asyncio.Event()     # commit-index advances wake the applier
         self._waiters: dict[int, asyncio.Future[LogEntry]] = {}  # submits awaiting apply
+        self.crashed = False                    # simulated failure; see crash()
+        self.blocked: set[str] = set()          # simulated partition; see set_blocked()
         self._tasks: list[asyncio.Task] = []
+        self._reload_config()
+
+    # ---- configuration, as a view over the log (§6) -------------------------
+    def _bootstrap_config(self) -> ClusterConfig:
+        """The configuration before any configuration entry exists: whatever this node
+        was told at startup. Once a config entry lands in the log it supersedes this."""
+        if self.cfg.learner:
+            # A learner boots OUTSIDE the configuration: it is nobody's voter until a
+            # replicated config entry says otherwise. Putting it in its own voter set
+            # would let a lone process consider itself a one-node cluster.
+            return ClusterConfig(learners={self.cfg.node_id: self.cfg.advertise_addr})
+        return ClusterConfig(voters={self.cfg.node_id: self.cfg.advertise_addr,
+                                     **self.cfg.peers})
+
+    @property
+    def is_voter(self) -> bool:
+        """Whether THIS node currently votes, according to the log — not according to
+        the flag it booted with.
+
+        `cfg.learner` is a startup role; membership is dynamic. Reading the flag at
+        runtime meant a promoted learner still refused to vote and still never
+        campaigned, so it inflated the quorum it would not help satisfy: a 4-voter
+        cluster containing one promoted node could not elect after a single failure."""
+        return (self.cfg.node_id in self.config.voters
+                or self.cfg.node_id in self.config.old_voters)
+
+    def _reload_config(self) -> None:
+        """Adopt the LATEST configuration entry in the log, committed or not.
+
+        "Regardless of whether the entry is committed" is the paper's wording and it is
+        deliberate: that configuration may be needed for the very election that commits
+        it. Because this reads the log rather than a cache, truncating a config entry
+        automatically falls back to the previous one."""
+        found = self.storage.last_config()
+        self.config = found[1] if found else self._bootstrap_config()
+        self.learners = dict(self.config.learners)
+        for peer_id, addr in {**self.config.voters, **self.config.old_voters,
+                              **self.config.learners}.items():
+            if peer_id != self.cfg.node_id and addr:
+                self.transport.add_peer(peer_id, addr)
 
     @property
     def quorum(self) -> int:
-        return (len(self.cfg.peers) + 1) // 2 + 1
+        """Majority of the CURRENT voter set, which is a view over the log rather
+        than the set this process was started with."""
+        return len(self.config.voters) // 2 + 1
 
     # ---- helpers -----------------------------------------------------------
     def _log(self, event: str, **ctx: object) -> None:
@@ -104,6 +156,11 @@ class RaftNode:
     # ---- RPC receivers (synchronous => atomic under the event loop) --------
     def handle_request_vote(self, req: RequestVoteRequest) -> RequestVoteResponse:
         self._observe_term(req.term)
+        if not self.is_voter:
+            # Not in any configuration: this node is not part of any quorum, so its
+            # vote would corrupt the count. Asks the LOG, not the startup flag, so a
+            # promoted learner starts voting the moment its promotion replicates.
+            return RequestVoteResponse(term=self.current_term, vote_granted=False)
         if req.term < self.current_term:  # stale candidate
             return RequestVoteResponse(term=self.current_term, vote_granted=False)
         up_to_date = (req.last_log_term, req.last_log_index) >= self._last_log_position()
@@ -136,11 +193,13 @@ class RaftNode:
             existing_term = self.storage.term_at(idx)
             if existing_term is None:  # clean append from here
                 self.storage.append(req.entries[offset:])
+                self._reload_config()  # entries may carry a configuration change
                 self._log("log_appended", from_index=idx, count=len(req.entries) - offset)
                 break
             if existing_term != incoming.term:  # conflict: truncate then append
                 self.storage.truncate_from(idx)
                 self.storage.append(req.entries[offset:])
+                self._reload_config()  # truncation can REVERT the configuration (§6)
                 self._log("log_truncated", from_index=idx)
                 break
         # Fig. 2 step 5: only trust leaderCommit as far as entries we just verified.
@@ -167,26 +226,31 @@ class RaftNode:
         )
         self._log("election_started")
 
-        async def ask(peer_id: str) -> RequestVoteResponse | None:
+        # Returns WHO answered alongside the answer: joint agreement is decided by
+        # which rosters the granters belong to, so an anonymous tally is not enough.
+        async def ask(peer_id: str) -> tuple[str, RequestVoteResponse] | None:
             if peer_id in self.blocked:  # partitioned link: same shape as unreachable
                 self.metrics.rpc_failures += 1
                 return None
             try:
-                return await self.transport.request_vote(peer_id, req)
+                return (peer_id, await self.transport.request_vote(peer_id, req))
             except TransportError:
                 self.metrics.rpc_failures += 1
                 return None
+
 
         votes = 1  # our own
         if votes >= self.quorum:  # single-node cluster elects itself instantly
             self._become_leader()
             return
-        pending = [asyncio.create_task(ask(p)) for p in sorted(self.cfg.peers)]
+        voters = set(self.config.voters) - {self.cfg.node_id}
+        pending = [asyncio.create_task(ask(p)) for p in sorted(voters)]
         try:
             for future in asyncio.as_completed(pending):
-                resp = await future
-                if resp is None:
+                answer = await future
+                if answer is None:
                     continue
+                _, resp = answer
                 self._observe_term(resp.term)
                 # Stale-reply guard: if the world moved while we awaited, stop.
                 if self.role is not Role.CANDIDATE or self.current_term != term_when_started:
@@ -200,12 +264,67 @@ class RaftNode:
             for task in pending:
                 task.cancel()
 
+    def _replication_targets(self) -> list[str]:
+        """The UNION of both voter halves plus learners. Everyone is replicated to;
+        only the voter halves are counted, and they are counted separately (§6)."""
+        everyone = {*self.config.voters, *self.config.old_voters, *self.config.learners}
+        return sorted(everyone - {self.cfg.node_id})
+
+    def _leader_append(self, command: ClusterConfig | NoOp) -> int:
+        """Append one of the leader's OWN entries (a no-op or a configuration).
+
+        Not used by submit(), which must register its waiter before commitment is
+        re-checked or a single-node cluster applies the entry before anyone is
+        listening. Everything else goes through here so that re-deriving the
+        configuration and re-checking commitment cannot be forgotten -- and so that a
+        single-node cluster, whose commit index moves nowhere else, does not stall."""
+        self.storage.append([LogEntry(term=self.current_term, command=command)])
+        self._reload_config()
+        index = self.storage.last_log_index()
+        self._advance_commit_index()
+        self._replicate_now.set()
+        return index
+
+    def add_learner(self, peer_id: str, addr: str) -> None:
+        """Attach a non-voting member, as a configuration entry in the log.
+
+        Safe without joint consensus precisely because quorum does not move: the node
+        joins `learners`, which no majority is ever computed over, so C-old and C-new
+        have identical voter sets and there is no transition to get wrong. It catches
+        up through the ordinary nextIndex walk, exactly like a follower returning from
+        a partition.
+
+        It goes in the log anyway — rather than staying leader-local — so that it
+        survives a leader change and reverts with the log if truncated."""
+        if self.role is not Role.LEADER:
+            raise NotLeaderError(self.leader_id)
+        if peer_id == self.cfg.node_id or peer_id in self.config.voters:
+            raise ValueError(f"{peer_id} is already a voting member")
+        if peer_id in self.config.learners:
+            return  # idempotent: the button can be pressed twice
+        updated = ClusterConfig(
+            voters=dict(self.config.voters),
+            old_voters=dict(self.config.old_voters),
+            learners={**self.config.learners, peer_id: addr},
+        )
+        self.next_index[peer_id] = self.storage.last_log_index() + 1
+        self.match_index[peer_id] = 0
+        self._leader_append(updated)
+        self._log("learner_added", peer=peer_id, addr=addr)
+
     def _become_leader(self) -> None:
         self.role = Role.LEADER
         self.leader_id = self.cfg.node_id
+        # A no-op from OUR term, appended immediately on winning. It flushes entries a
+        # previous leader committed but never applied (thesis §6.4), and committing it
+        # is the precondition for any membership change: a leader holding an
+        # uncommitted config entry from an earlier term cannot otherwise tell whether
+        # that entry is committed, and acting on the guess is how you get two leaders.
+        self._reload_config()  # a truncation may have moved us; re-derive before leading
+        self._noop_index = self._leader_append(NoOp())
         last = self.storage.last_log_index()
-        self.next_index = {p: last + 1 for p in self.cfg.peers}
-        self.match_index = {p: 0 for p in self.cfg.peers}
+        self.next_index = {p: last + 1 for p in self._replication_targets()}
+        self.match_index = {p: 0 for p in self._replication_targets()}
         self._log("became_leader", quorum=self.quorum)
         self._replicate_now.set()  # assert leadership with an immediate heartbeat
 
@@ -252,7 +371,10 @@ class RaftNode:
         for candidate_index in range(self.storage.last_log_index(), self.commit_index, -1):
             if self.storage.term_at(candidate_index) != self.current_term:
                 break  # terms only shrink going backwards; nothing below qualifies
-            acked = 1 + sum(1 for m in self.match_index.values() if m >= candidate_index)
+            # VOTERS only. A learner is replicated to and must never be counted, or
+            # a majority-of-four commits on three acks and one of them cannot vote.
+            acked = 1 + sum(1 for p, m in self.match_index.items()
+                            if m >= candidate_index and p in self.config.voters)
             if acked >= self.quorum:
                 self.commit_index = candidate_index
                 self._log("commit_advanced", commit_index=candidate_index)
@@ -266,6 +388,9 @@ class RaftNode:
         if self.role is not Role.LEADER:
             raise NotLeaderError(self.leader_id)
         self.storage.append([LogEntry(term=self.current_term, command=cmd)])
+        self._reload_config()  # a client command never changes membership, but the
+        # invariant "config is a pure function of the log" is only worth anything if
+        # it holds at EVERY append site, with no exceptions to remember.
         index = self.storage.last_log_index()
         self._log("submitted", key=cmd.key, op=cmd.op, index=index, request_id=cmd.request_id)
         waiter: asyncio.Future[LogEntry] = asyncio.get_running_loop().create_future()
@@ -277,14 +402,18 @@ class RaftNode:
         finally:
             self._waiters.pop(index, None)
         # Students' Guide "re-appearing index": another leader may have filled this
-        # index with a different entry. Trust the request_id, not the index.
-        if applied.command.request_id != cmd.request_id:
+        # index with a different entry. Trust the request_id, not the index -- and note
+        # the replacement need not even be a client command: a new leader's no-op or a
+        # configuration entry can land on this index, so check the TYPE before the id.
+        if not isinstance(applied.command, Command) or applied.command.request_id != cmd.request_id:
             raise NotLeaderError(self.leader_id)
 
     # ---- background tasks --------------------------------------------------
     async def _election_timer_loop(self) -> None:
         while True:
             await asyncio.sleep(self.cfg.tick_interval)
+            if not self.is_voter:
+                continue  # not in the configuration: campaigning would be meaningless
             if self.role is Role.LEADER:
                 continue
             if time.monotonic() - self._last_reset >= self._election_timeout:
@@ -298,10 +427,11 @@ class RaftNode:
             round_started = time.monotonic()
             term_when_sent = self.current_term
             await asyncio.gather(
-                *(self._append_to_peer(p, term_when_sent) for p in sorted(self.cfg.peers))
+                *(self._append_to_peer(p, term_when_sent)
+                  for p in self._replication_targets())
             )
             # Heartbeat cadence minus time already spent this round — a slow peer must
-            # not stretch the gap toward election_timeout.
+            # not stretch the gap toward election_timeout. submit() cuts the wait short.
             remaining = max(
                 0.0, self.cfg.heartbeat_interval - (time.monotonic() - round_started)
             )
@@ -318,8 +448,12 @@ class RaftNode:
                 index = self.last_applied + 1
                 applied_entry = self.storage.entry(index)
                 assert applied_entry is not None  # committed implies present
-                self.storage.apply(index, applied_entry.command)  # atomic w/ last_applied
-                self._log("applied", index=index, key=applied_entry.command.key)
+                cmd = applied_entry.command
+                if isinstance(cmd, Command):
+                    self.storage.apply(index, cmd)  # atomic w/ last_applied
+                    self._log("applied", index=index, key=cmd.key)
+                else:  # configuration or no-op: nothing to apply, but do not stall
+                    self.storage.advance_applied(index)
                 self.last_applied = index
                 waiter = self._waiters.get(index)
                 if waiter is not None and not waiter.done():
@@ -361,7 +495,8 @@ class RaftNode:
         of them, because commit needs a majority it can no longer reach. Blocking
         counts as an rpc failure rather than an error, which is what an unreachable
         peer already looks like from in here."""
-        unknown = [p for p in peers if p not in self.cfg.peers]
+        known = {*self.config.voters, *self.config.old_voters, *self.config.learners}
+        unknown = [p for p in peers if p not in known]
         if unknown:
             raise ValueError(f"not peers of {self.cfg.node_id}: {', '.join(sorted(unknown))}")
         self.blocked = set(peers)
@@ -421,6 +556,12 @@ class RaftNode:
             voted_for=self.voted_for, leader_id=self.leader_id,
             log_length=last_index, last_log_term=last_term,
             commit_index=self.commit_index, last_applied=self.last_applied,
-            kv=self.storage.kv_all(), peers=dict(self.cfg.peers),
-            blocked=sorted(self.blocked), metrics=self.metrics,
+            kv=self.storage.kv_all(),
+            # `peers` is the CURRENT voter set minus self, derived from the log, so it
+            # tracks membership changes instead of reporting the startup configuration.
+            peers={k: v for k, v in self.config.voters.items() if k != self.cfg.node_id},
+            learners=dict(self.config.learners), learner=not self.is_voter,
+            advertise_addr=self.cfg.advertise_addr, blocked=sorted(self.blocked),
+            config=self.config, quorum=self.quorum,
+            metrics=self.metrics,
         )

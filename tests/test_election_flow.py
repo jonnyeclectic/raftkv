@@ -17,7 +17,8 @@ async def test_candidate_wins_with_quorum(make_node, when):
     await node._start_election()
     assert node.role is Role.LEADER  # self + node-2 = 2 of 3
     assert node.current_term == 1
-    assert node.next_index == {"node-2": 1, "node-3": 1}  # empty log, so start at 1
+    # index 1 is the no-op this leader appended on winning, so followers start at 2
+    assert node.next_index == {"node-2": 2, "node-3": 2}
     assert node.match_index == {"node-2": 0, "node-3": 0}
     verify(transport).request_vote("node-2", ANY(RequestVoteRequest))
 

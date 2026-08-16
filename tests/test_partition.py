@@ -1,4 +1,4 @@
-"""Simulated network partitions.
+"""Simulated network partitions, driven from the dashboard.
 
 A partition is not a crash, and the gap between them is the most interesting thing
 this cluster does: a partitioned leader stays up, keeps accepting writes, and cannot
@@ -52,9 +52,10 @@ def test_partitioned_leader_accepts_the_write_and_cannot_commit_it(tmp_path):
                 node.submit(Command(op="set", key="k", value="v", request_id="r1")),
                 timeout=1.5,
             )
-        assert node.storage.last_log_index() == 1  # the doomed write, appended...
-        assert node.commit_index == 0              # ...and it can never commit
-        assert node.role is Role.LEADER            # still leader: this is not a crash
+        # index 1 is the no-op appended on winning; index 2 is the doomed write
+        assert node.storage.last_log_index() == 2  # appended...
+        assert node.commit_index == 0              # ...neither can ever commit
+        assert node.role is Role.LEADER            # and still leader: this is not a crash
         await node.stop()
         node.storage.close()
 
@@ -77,6 +78,16 @@ def test_set_blocked_rejects_a_node_that_is_not_a_peer(tmp_path):
     with pytest.raises(ValueError):
         node.set_blocked(["node-9"])
     assert node.blocked == set()  # nothing applied on the failing call
+    node.storage.close()
+
+
+def test_a_learner_link_can_be_partitioned_too(tmp_path):
+    node = make_node(tmp_path)
+    node.current_term = 1
+    node._become_leader()
+    node.add_learner("node-4", "127.0.0.1:8004")
+    node.set_blocked(["node-4"])
+    assert node.blocked == {"node-4"}
     node.storage.close()
 
 

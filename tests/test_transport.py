@@ -87,3 +87,31 @@ async def test_memory_transport_partition_and_heal():
         await transport.request_vote("node-2", VOTE_REQ)
     transport.heal()
     assert (await transport.request_vote("node-2", VOTE_REQ)).vote_granted
+
+
+async def test_unknown_peer_is_a_transport_error_not_a_keyerror():
+    """Found by adversarial review, and it cost a node its ability to ever campaign.
+
+    A configuration can legitimately name a peer this node cannot dial: config entries
+    replicate, and one carrying an empty advertise address (a bootstrap node that was
+    never told its own) reaches a later-joined member as a voter with no address. The
+    dial was a bare dict subscript OUTSIDE the try, so the KeyError escaped every
+    `except TransportError` in raft.py and killed _election_timer_loop permanently --
+    the node then sat as a follower forever, silently, with no error to see.
+    """
+    transport = HttpTransport({"node-2": "127.0.0.1:9"}, rpc_timeout=0.05)
+    with pytest.raises(TransportError):
+        await transport.request_vote("node-404", VOTE_REQ)
+    # ...and the same for a peer registered with no address at all.
+    transport.add_peer("node-3", "")
+    with pytest.raises(TransportError):
+        await transport.request_vote("node-3", VOTE_REQ)
+    await transport.aclose()
+
+
+async def test_memory_transport_unknown_node_is_unreachable():
+    """The in-process double has to be able to reproduce it, or the suite cannot."""
+    transport = MemoryTransport()
+    transport.register("node-2", FakeNode())
+    with pytest.raises(TransportError):
+        await transport.request_vote("node-404", VOTE_REQ)

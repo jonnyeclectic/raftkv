@@ -32,6 +32,11 @@ class KVWrite(BaseModel):
     value: str = Field(min_length=1, max_length=4096)
 
 
+class AddLearner(BaseModel):
+    node_id: str = Field(min_length=1, max_length=64)
+    addr: str = Field(min_length=3, max_length=255, pattern=r"^[A-Za-z0-9.\-]+:\d{1,5}$")
+
+
 class Partition(BaseModel):
     """Replace semantics: the full set of peers this node cannot talk to. []=healed."""
 
@@ -84,8 +89,8 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
         return JSONResponse(status_code=500, content={"error": "internal"})
 
     def refuse_if_crashed() -> None:
-        """A crashed node answers nothing except /admin/recover — peers see
-        connection-level failure semantics (503), not a polite reply."""
+        """A crashed node answers nothing except /admin/recover and the dashboard —
+        peers see connection-level failure semantics (503), not a polite reply."""
         if node.crashed:
             raise HTTPException(status_code=503, detail="node is down (simulated crash)")
 
@@ -132,7 +137,7 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
         value = storage.kv_get(key)
         if value is None:
             raise HTTPException(status_code=404, detail="key not found")
-        # Local read — honest about consistency: may lag the leader
+        # Local read — honest about consistency: may lag the leader (FAILURE_MODES.md)
         return {"key": key, "value": value, "read_from": cfg.node_id, "role": node.role}
 
     # ---- simulated failure -------------------------------------------------
@@ -164,6 +169,17 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
             log_event(logger, "admin_partition", node=cfg.node_id, blocked=sorted(node.blocked))
             return {"ok": True, "node": cfg.node_id, "blocked": sorted(node.blocked)}
 
+        @app.post("/admin/add-learner")
+        async def admin_add_learner(body: AddLearner) -> dict:
+            """Attach a non-voting member. Leader-only, and NotLeaderError already
+            maps to 503 + leader_id so the caller knows where to retry."""
+            refuse_if_crashed()
+            try:
+                node.add_learner(body.node_id, body.addr)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"ok": True, "learner": body.node_id, "addr": body.addr}
+
     # ---- observability -----------------------------------------------------
     @app.get("/state")
     async def state() -> NodeState:
@@ -181,8 +197,8 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard() -> str:
-        # Re-read per request rather than cached at import: the page has no build step,
-        # so a UI edit should show up on reload instead of on a restart.
+        # Re-read per request rather than cached at import: the page has no build
+        # step, so a UI edit shows up on reload instead of on a restart.
         return (resources.files("raftkv") / "static" / "dashboard.html").read_text()
 
     return app

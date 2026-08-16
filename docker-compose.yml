@@ -9,6 +9,7 @@ services:
       # address. That config entry replicates, and a later-joined node inherits a voter
       # it can never dial -- so it can never collect that vote. Set on every node, not
       # just the learners, because every node's own address now travels in the log.
+      RAFT_ADVERTISE: raft-node-1:8000
     volumes: ["node1-data:/data", "node1-logs:/var/log/raftkv"]
     healthcheck: &hc
       test: ["CMD", "python", "-c",
@@ -22,6 +23,7 @@ services:
     environment:
       RAFT_NODE_ID: node-2
       RAFT_PEERS: node-1=raft-node-1:8000,node-3=raft-node-3:8000
+      RAFT_ADVERTISE: raft-node-2:8000
     volumes: ["node2-data:/data", "node2-logs:/var/log/raftkv"]
     healthcheck: *hc
   raft-node-3:
@@ -30,7 +32,29 @@ services:
     environment:
       RAFT_NODE_ID: node-3
       RAFT_PEERS: node-1=raft-node-1:8000,node-2=raft-node-2:8000
+      RAFT_ADVERTISE: raft-node-3:8000
     volumes: ["node3-data:/data", "node3-logs:/var/log/raftkv"]
+    healthcheck: *hc
+  # Started but NOT a member: no peers, never campaigns, invisible to the other three
+  # until the dashboard's "add node" attaches it as a learner. RAFT_ADVERTISE is what
+  # the leader dials — the published 8004 only exists for the browser.
+  raft-node-4:
+    build: .
+    ports: ["8004:8000"]
+    environment:
+      RAFT_NODE_ID: node-4
+      RAFT_LEARNER: "1"
+      RAFT_ADVERTISE: raft-node-4:8000
+    volumes: ["node4-data:/data", "node4-logs:/var/log/raftkv"]
+    healthcheck: *hc
+  raft-node-5:
+    build: .
+    ports: ["8005:8000"]
+    environment:
+      RAFT_NODE_ID: node-5
+      RAFT_LEARNER: "1"
+      RAFT_ADVERTISE: raft-node-5:8000
+    volumes: ["node5-data:/data", "node5-logs:/var/log/raftkv"]
     healthcheck: *hc
 volumes:
   node1-data: {}
@@ -39,3 +63,7 @@ volumes:
   node2-logs: {}
   node3-data: {}
   node3-logs: {}
+  node4-data: {}
+  node4-logs: {}
+  node5-data: {}
+  node5-logs: {}

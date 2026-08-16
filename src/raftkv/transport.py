@@ -23,6 +23,8 @@ class TransportError(Exception):
 
 
 class Transport(Protocol):
+    def add_peer(self, peer_id: str, addr: str) -> None: ...
+
     async def request_vote(
         self, peer_id: str, req: RequestVoteRequest
     ) -> RequestVoteResponse: ...
@@ -34,8 +36,15 @@ class Transport(Protocol):
 
 class HttpTransport:
     def __init__(self, peers: dict[str, str], rpc_timeout: float) -> None:
+        # COPY, never alias: this dict is usually NodeConfig.peers, which defines the
+        # voting set. add_peer() writing through to it would slip a learner into
+        # quorum — _advance_commit_index() reads cfg.peers on every call.
         self._peers = dict(peers)
         self._client = httpx.AsyncClient(timeout=rpc_timeout)
+
+    def add_peer(self, peer_id: str, addr: str) -> None:
+        """Register a dial address at runtime — a learner joins after startup."""
+        self._peers[peer_id] = addr
 
     async def request_vote(
         self, peer_id: str, req: RequestVoteRequest
@@ -48,7 +57,17 @@ class HttpTransport:
         return await self._post(peer_id, "/raft/append-entries", req, AppendEntriesResponse)
 
     async def _post(self, peer_id, path, req, response_model):
-        url = f"http://{self._peers[peer_id]}{path}"
+        # An unknown or address-less peer is a TRANSPORT failure, not a crash. This was
+        # a bare self._peers[peer_id] outside the try, so a KeyError escaped past every
+        # `except TransportError` in raft.py and killed _election_timer_loop outright —
+        # the node then never campaigned again, silently, for the life of the process.
+        # A configuration can legitimately name a peer this node cannot dial (a config
+        # entry carrying an empty advertise address replicates like any other), so the
+        # unreachable path has to be the ordinary one.
+        addr = self._peers.get(peer_id)
+        if not addr:
+            raise TransportError(f"{path} -> {peer_id}: no dial address")
+        url = f"http://{addr}{path}"
         try:
             resp = await self._client.post(url, json=req.model_dump())
             resp.raise_for_status()
@@ -72,6 +91,10 @@ class MemoryTransport:
     def register(self, node_id: str, node: object) -> None:
         self.nodes[node_id] = node
 
+    def add_peer(self, peer_id: str, addr: str) -> None:
+        """No-op: in-process delivery routes by node_id, so there is no address to
+        learn. Present so RaftNode.add_learner() works against either transport."""
+
     def crash(self, node_id: str) -> None:
         self.down.add(node_id)
 
@@ -92,6 +115,11 @@ class MemoryTransport:
         self.blocked.clear()
 
     def _check_link(self, src: str, dst: str) -> None:
+        # Unregistered destination is unreachable, not a crash -- same reasoning as
+        # HttpTransport._post. Without this the in-process suite could not even
+        # reproduce "the configuration names a peer this node cannot dial".
+        if dst not in self.nodes:
+            raise TransportError(f"link {src} -> {dst}: no such node")
         if src in self.down or dst in self.down or frozenset((src, dst)) in self.blocked:
             raise TransportError(f"link {src} -> {dst} is down")
 

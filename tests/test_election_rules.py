@@ -51,9 +51,15 @@ def test_rejects_candidate_with_shorter_log_same_term(make_node):
 
 
 def test_empty_log_candidate_never_wins_however_high_its_term(make_node):
-    """§5.4.1 compares LOGS, not terms, so no amount of term inflation lets a node
-    without the data lead the nodes that have it. It does depose the leader every time
-    though (see the term assertion), which is the disruptive-server problem."""
+    """Seen in the wild on 2026-08-15: a node whose database had been wiped rejoined a
+    cluster holding one committed entry and campaigned 16 consecutive times, terms 5
+    through 20. It never won a single vote. §5.4.1 compares LOGS, not terms, so no
+    amount of term inflation lets a node without the data lead the nodes that have it —
+    which is precisely what stops it from erasing that data.
+
+    It did depose the leader every time, though (see the term assertion): that is the
+    disruptive-server problem PreVote solves, listed as a deliberate omission in
+    docs/FAILURE_MODES.md."""
     voter = make_node()
     voter.storage.append([entry(term=6)])  # the one committed entry the peers held
     for term in range(5, 21):

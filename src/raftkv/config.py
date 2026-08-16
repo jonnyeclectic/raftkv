@@ -22,6 +22,14 @@ class NodeConfig(BaseModel):
     # RAFT_ADMIN_ENABLED=0 and inject failure from the orchestrator
     # (kubectl delete pod / compose stop).
     admin_enabled: bool = True
+    # A learner receives the log but never votes and never campaigns, so adding one
+    # does NOT move quorum — which is why it needs no joint consensus (§6). This is how
+    # etcd and LogCabin stage a new member before promoting it to a voter.
+    learner: bool = False
+    # How OTHER nodes should dial this one. Differs from the address a browser uses
+    # whenever there is a port mapping in the way (compose publishes 8004 to the host
+    # but peers must use raft-node-4:8000). Empty means "not advertising".
+    advertise_addr: str = ""
 
     @model_validator(mode="after")
     def _sane_timing(self) -> NodeConfig:
@@ -62,6 +70,8 @@ class NodeConfig(BaseModel):
             ("election_timeout_max", "RAFT_ELECTION_MAX"),
             ("commit_timeout", "RAFT_COMMIT_TIMEOUT"),
             ("admin_enabled", "RAFT_ADMIN_ENABLED"),
+            ("learner", "RAFT_LEARNER"),
+            ("advertise_addr", "RAFT_ADVERTISE"),
         ]:
             if (value := os.getenv(env)) is not None:
                 raw[field] = value

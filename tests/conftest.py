@@ -36,6 +36,9 @@ async def eventually(predicate, timeout: float = 3.0, interval: float = 0.02) ->
 class StubTransport:
     """Real object with the Transport shape; mockito stubs its methods per-test."""
 
+    def add_peer(self, peer_id, addr):
+        """Config entries register dial addresses at runtime; nothing to do in-process."""
+
     async def request_vote(self, peer_id, req):
         raise NotImplementedError
 
@@ -55,6 +58,9 @@ class SimCluster:
         self.tmp_path = tmp_path
         self.transport = MemoryTransport()
         self.ids = [f"node-{i}" for i in range(1, n + 1)]
+        # Applied to every node, and re-applied by restart(). Lets a test widen a single
+        # timing knob (a flood needs a commit_timeout that survives a loaded CI box)
+        # without turning TEST_TIMING into a per-test negotiation.
         self.overrides = overrides
         self.nodes = {}
         for node_id in self.ids:
@@ -80,7 +86,7 @@ class SimCluster:
         # close node-1, stop node-2) leaves node-2's replication loop calling
         # handle_append_entries on a node whose sqlite connection is already closed —
         # harmless at teardown, but it prints a spurious traceback that looks exactly
-        # like a real failure.
+        # like a real failure. A flood in flight makes it fire almost every run.
         for node in self.nodes.values():
             await node.stop()
         for node in self.nodes.values():

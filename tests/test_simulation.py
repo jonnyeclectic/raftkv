@@ -86,8 +86,8 @@ async def test_partitioned_leader_cannot_commit_then_steps_down(cluster):
         )
         # Explicit divergence repair: the doomed r2 entry was truncated and replaced
         # by the new leader's r3 entry (§5.3 conflict rule, directly). Located by
-        # scanning rather than by index -- the absolute position depends on how many
-        # elections the run happened to hold.
+        # scanning rather than by index -- leaders append a no-op on winning, so the
+        # absolute position depends on how many elections the run happened to hold.
         request_ids = [
             e.command.request_id
             for i in range(1, stale.storage.last_log_index() + 1)

@@ -295,6 +295,15 @@
       <div id="nodes"></div>
     </section>
 
+    <!-- Populated only when an unattached node answers. A StatefulSet replica or a
+         compose service is a PROCESS; membership lives in the replicated log, so a
+         started node is not a member until the leader appends a config entry. -->
+    <section id="staged-wrap" hidden>
+      <div class="label" style="margin-bottom:var(--s3)">
+        staged · running, in no cluster until attached
+      </div>
+      <div id="staged"></div>
+    </section>
 
   </div>
 
@@ -320,8 +329,18 @@
           <button id="setbtn" type="button" class="primary">set on leader</button>
           <button id="delbtn" type="button">delete</button>
         </div>
+        <!-- Escape hatch for an address this tab is not probing (a kubectl port-forward,
+             a node on another host). The staged cards are the normal path. -->
+        <div class="ctl">
+          <input id="newaddr" placeholder="host:port" autocomplete="off">
+          <button id="addbtn" type="button">attach by address</button>
+        </div>
         <div class="ctl">
           <button id="healbtn" type="button">heal all links</button>
+        </div>
+        <div class="ctl">
+          <span class="label">learners do not move quorum · per-node reset keeps
+            membership · reset all reverts it</span>
         </div>
         <div class="ctl"><span id="status"></span></div>
       </div>
@@ -354,6 +373,7 @@ let NODES = (params.get("nodes")
    see one is to knock. Probed rather than seeded into NODES: an address that has never
    answered cannot be classified, and a 3-node deployment showing two permanent
    unreachable cards is worse than not knowing. An explicit ?nodes= turns this off. */
+const PROBE = params.get("nodes") ? [] : ["127.0.0.1:8004", "127.0.0.1:8005"];
 
 const states = {};        // addr -> NodeState | null
 const OPEN_DETAILS = new Set();   // <details> is rebuilt every tick; keep open state outside the DOM
@@ -378,7 +398,41 @@ function byId() {
   return map;
 }
 
-function memberAddrs() { return NODES; }
+// Knock on the staging addresses; adopt whoever answers. Runs every tick, so a node
+// started after the tab was opened shows up, and once adopted it STAYS in NODES --
+// by then it has been seen, so a later silence is a crash worth rendering, not an
+// address that might be nothing.
+async function discover() {
+  await Promise.all(PROBE.map(async addr => {
+    if (NODES.includes(addr)) return;
+    try {
+      if ((await fetch(`http://${addr}/state`, {signal: AbortSignal.timeout(700)})).ok) {
+        NODES.push(addr);
+      }
+    } catch { /* nothing there; ask again next tick */ }
+  }));
+}
+
+/* --- node classification (behaviour pinned by tests/test_dashboard_staged.py) -------
+   Member or staged, decided by the node's OWN log rather than by a UI convention: the
+   configuration is a view over the log (§6), so a process started with no peers that
+   has never received a config entry has an empty voter set. It is up, it is reachable,
+   and it belongs to no cluster. The test needs no leader, which matters because it has
+   to keep working during the election that a staged node is waiting through.
+
+   `!!s` is load-bearing twice over. Unreachable (null) counts as a MEMBER: a killed
+   node-1 must not quietly reclassify itself out of the cluster the moment it stops
+   answering -- it would vanish from the topology and from the quorum arithmetic at
+   exactly the moment both matter most. And stagedCard() reads
+   s.node_id unguarded, which is only safe because a null can never reach it: relax
+   this to `s?.config` and every crashed node throws on every tick, taking the whole
+   render loop down with it. */
+function isStaged(s) {
+  return !!s && Object.keys(s.config?.voters ?? {}).length === 0;
+}
+function memberAddrs() { return NODES.filter(a => !isStaged(states[a])); }
+function stagedAddrs() { return NODES.filter(a => isStaged(states[a])); }
+/* --- end node classification ------------------------------------------------------ */
 
 /* --- leader selection --------------------------------------------------------------
    The first node reporting itself leader wins. */
@@ -860,6 +914,32 @@ function nodeActions(addr, s) {
   return acts;
 }
 
+// A node in no cluster has no term worth reading, no leader, and no log to compare --
+// every field the member card leads with is zero and means nothing. So the staged card
+// shows the two facts that ARE true (it is alive, and it is not a member) and the one
+// action that changes that.
+function stagedCard(addr) {
+  const s = states[addr];
+  const card = el("div", "node staged");
+  const head = el("div", "node-head");
+  head.append(el("b", "", s.node_id), el("span", "label", addr),
+              el("span", "role", "unattached"));
+  card.append(head);
+  card.append(el("div", "label", "running · empty voter set · nobody replicates to it"));
+
+  const acts = el("div", "node-actions");
+  const join = el("button", "primary", "attach as learner");
+  join.type = "button";
+  join.title = "quorum does not move, so this needs no joint consensus";
+  join.addEventListener("click", () => attach(addr));
+  const wipe = el("button", "danger", "reset");
+  wipe.type = "button";
+  wipe.addEventListener("click", () => admin(addr, "reset"));
+  acts.append(join, wipe);
+  card.append(acts);
+  return card;
+}
+
 function renderNodes() {
   // Never rebuild a list someone has hold of -- see scrollHeld(). The cards go stale for
   // the length of the drag, which is the correct trade: you are reading, not watching.
@@ -867,6 +947,10 @@ function renderNodes() {
   const host = mount("nodes");
   host.replaceChildren(...memberAddrs().map(nodeCard));
   restoreScroll(host);  // must follow the attach: scrollTop is dropped while detached
+  const staged = stagedAddrs();
+  mount("staged").replaceChildren(...staged.map(stagedCard));
+  const wrap = document.getElementById("staged-wrap");
+  if (wrap) wrap.hidden = staged.length === 0;
 }
 
 /* ================= event feed ================= */
@@ -1060,9 +1144,53 @@ async function healAll() {
   setStatus(`healed ${ok}/${NODES.length} nodes`, ok === NODES.length ? "ok" : "err");
 }
 
+// Join a running-but-idle node as a NON-VOTING learner. Quorum does not move, so this
+// needs no joint consensus (§6) -- the node just starts receiving the log and catches
+// up through the ordinary nextIndex walk.
+async function addNode() {
+  const input = document.getElementById("newaddr");
+  if (!input) return;
+  const addr = input.value.trim();
+  if (!ADDR_SHAPE.test(addr)) return setStatus("address must be host:port", "err");
+  if (await attach(addr)) input.value = "";
+}
+
+async function attach(addr) {
+  const leader = leaderAddr();
+  if (!leader) { setStatus("no leader visible", "err"); return false; }
+  setStatus(`asking ${addr} who it is...`);
+  try {
+    // Ask the newcomer for its own id and the address PEERS should dial, which is not
+    // necessarily the one the browser just used (compose publishes a different port).
+    const who = await fetch(`http://${addr}/state`, {signal: AbortSignal.timeout(2000)});
+    if (!who.ok) { setStatus(`${addr} answered ${who.status}`, "err"); return false; }
+    const s = await who.json();
+    const r = await fetch(`http://${leader}/admin/add-learner`, {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({node_id: s.node_id, addr: s.advertise_addr || addr}),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      setStatus(`error ${r.status} ${d.error ?? d.detail ?? ""}`.trim(), "err");
+      return false;
+    }
+    // Start polling an address the probe list does not cover. The probed ones are
+    // already in NODES; no ?nodes= rewrite is needed for them, and forcing one would
+    // pin the watch list and switch the probe off for every later reload.
+    if (!NODES.includes(addr)) NODES.push(addr);
+    setStatus(`${s.node_id} joined as learner via ${leader}`, "ok");
+    return true;
+  } catch (e) {
+    setStatus(`attach ${addr} failed: ${e}`, "err");
+    return false;
+  }
+}
+
 /* ================= loops ================= */
 
 async function tick() {
+  await discover();
   await Promise.all(NODES.map(poll));
   renderSystem();
   renderNodes();
@@ -1076,12 +1204,16 @@ function frame(ts) {
 
 document.getElementById("setbtn")?.addEventListener("click", write);
 document.getElementById("delbtn")?.addEventListener("click", removeKey);
+document.getElementById("addbtn")?.addEventListener("click", addNode);
 document.getElementById("healbtn")?.addEventListener("click", healAll);
 for (const id of ["key", "value"]) {
   document.getElementById(id)?.addEventListener("keydown", e => {
     if (e.key === "Enter") { e.preventDefault(); write(); }
   });
 }
+document.getElementById("newaddr")?.addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); addNode(); }
+});
 
 tick();
 setInterval(tick, 500);

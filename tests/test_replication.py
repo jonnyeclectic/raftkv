@@ -31,9 +31,9 @@ async def test_success_updates_match_index_from_sent_args(make_node, when):
         AppendEntriesResponse(term=1, success=True)
     )
     await node._append_to_peer("node-2", term_when_sent=1)
-    # prev(0) + the 2 entries we actually sent, FROM THE SENT ARGS
-    assert node.match_index["node-2"] == 2
-    assert node.next_index["node-2"] == 3  # match + 1
+    # prev(0) + 3 sent, FROM THE SENT ARGS: the term's no-op plus both entries
+    assert node.match_index["node-2"] == 3
+    assert node.next_index["node-2"] == 4  # match + 1
 
 
 async def test_failure_backs_off_next_index(make_node, when):
@@ -101,8 +101,8 @@ async def test_submit_commits_and_applies_on_single_node(make_node):
     try:
         await node.submit(Command(op="set", key="temp", value="72", request_id="r1"))
         assert node.storage.kv_get("temp") == "72"
-        assert node.last_applied == 1
-        assert node.commit_index == 1  # one voter, so appending is committing
+        assert node.last_applied == 2  # index 1 is the leader's no-op, 2 is the write
+        assert node.commit_index == 2  # the term's no-op and the write both commit
     finally:
         await node.stop()
 
