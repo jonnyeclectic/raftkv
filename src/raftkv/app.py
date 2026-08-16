@@ -3,11 +3,12 @@ Run: uvicorn --factory raftkv.app:create_app (config comes from RAFT_* env vars)
 
 import logging
 from contextlib import asynccontextmanager
+from importlib import resources
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from raftkv.config import NodeConfig
@@ -120,5 +121,11 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
     @app.get("/healthz")
     async def healthz() -> dict:
         return {"ok": True, "node": cfg.node_id}
+
+    @app.get("/", response_class=HTMLResponse)
+    async def dashboard() -> str:
+        # Re-read per request rather than cached at import: the page has no build step,
+        # so a UI edit should show up on reload instead of on a restart.
+        return (resources.files("raftkv") / "static" / "dashboard.html").read_text()
 
     return app

@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>raftkv cluster</title>
+<link rel="icon" href="data:,">   <!-- silences a 404 that clutters the browser console -->
+<style>
+  /* ------------------------------------------------------------------
+     Design system. Every value below comes off a scale; nothing is
+     hand-picked per element, which is what keeps a page like this from
+     drifting once features get bolted on later.
+
+     space  4 8 12 16 24 32 48        (--s1 .. --s7)
+     type   11 12 13 15 17 20 26      (--t1 .. --t7)
+     radius 4 (controls) 8 (panels)   nothing else
+     shade  five neutrals, cool-tinted; role colors are semantic only
+     ------------------------------------------------------------------ */
+  :root {
+    /* neutrals, tinted toward blue rather than dead grey */
+    --bg:      #0b0f14;
+    --panel:   #131a22;
+    --raised:  #1a232d;
+    --line:    #26313d;
+    --line-hi: #35434f;
+    --ink:     #e8eef5;
+    --ink-mid: #9fb0c0;
+    --ink-dim: #7b8d9e;   /* 4.65:1 on the darkest surface it lands on */
+
+    /* semantic only: role and state. Not decoration. */
+    --leader:    #3fb950;
+    --candidate: #d29922;
+    --follower:  #58a6ff;
+    --learner:   #a371f7;
+    --down:      #f85149;
+    --cut:       #db6d28;
+
+    --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px; --s7:48px;
+    --t1:11px; --t2:12px; --t3:13px; --t4:15px; --t5:17px; --t6:20px; --t7:26px;
+
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: var(--s5);
+    background: var(--bg);
+    color: var(--ink);
+    font: 400 var(--t3)/1.5 var(--mono);
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2 { margin: 0; }
+
+  /* labels are secondary: small, dim, spaced. They never compete with values. */
+  .label {
+    font-size: var(--t1);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+  }
+  .num { font-variant-numeric: tabular-nums; }
+
+  /* ---------- masthead + health strip ---------- */
+  header {
+    display: flex; flex-wrap: wrap; align-items: baseline;
+    gap: var(--s3) var(--s5);
+    margin-bottom: var(--s5);
+  }
+  h1 { font-size: var(--t6); font-weight: 700; letter-spacing: -.01em; }
+  #health {
+    display: flex; flex-wrap: wrap; gap: var(--s2);
+    margin-left: auto;
+  }
+  .stat {
+    display: flex; align-items: baseline; gap: var(--s2);
+    padding: var(--s2) var(--s3);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+  }
+  .stat b { font-size: var(--t4); font-weight: 600; }
+  .stat.warn { border-color: var(--candidate); }
+  .stat.bad  { border-color: var(--down); }
+  .stat.warn b { color: var(--candidate); }
+  .stat.bad  b { color: var(--down); }
+
+  /* ---------- page grid: work on the left, context + feed on the right ---------- */
+  .grid {
+    display: grid;
+    /* The rail is capped, not proportional: on a wide screen a 1fr rail grows to
+       ~670px and the event feed turns into unreadably long lines, while the node cards
+       it stole the width from go without. */
+    grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
+    gap: var(--s4);
+    align-items: start;
+  }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: var(--shadow-sm);
+  }
+  .panel > header {
+    display: flex; align-items: center; gap: var(--s3);
+    margin: 0;
+    padding: var(--s3) var(--s4);
+    border-bottom: 1px solid var(--line);
+  }
+  .panel > .body { padding: var(--s4); }
+  .stack { display: flex; flex-direction: column; gap: var(--s4); }
+
+  /* ---------- topology canvas ---------- */
+  #topo { display: block; width: 100%; height: 300px; }
+  .legend { display: flex; flex-wrap: wrap; gap: var(--s3); padding: 0 var(--s4) var(--s3); }
+  .key { display: flex; align-items: center; gap: var(--s1); font-size: var(--t1); color: var(--ink-dim); }
+  .key i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+
+  /* ---------- node cards ---------- */
+  /* A card needs ~343px: the log/commit/applied row alone measures 310. At full
+     width the left column clears 1100px and all three sit in one row. Spanning the
+     odd card instead was tried and rejected -- it stretched one table across 790px,
+     which pulls labels away from their values for no gain. */
+  #nodes, #staged { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: var(--s4); }
+  /* Staged nodes are running processes that are in no cluster. Dashed and recessed,
+     because the distinction the eye needs to make first is member vs not-a-member --
+     not which role a non-member holds, which is a question with no answer. */
+  .node.staged {
+    border: 1px dashed var(--line);
+    border-left: 3px dashed var(--ink-dim);
+    background: none;
+    box-shadow: none;
+  }
+  .node {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--follower);
+    border-radius: 8px;
+    padding: var(--s4);
+    box-shadow: var(--shadow-sm);
+  }
+  .node.leader    { border-left-color: var(--leader); }
+  .node.candidate { border-left-color: var(--candidate); }
+  .node.down      { border-left-color: var(--down); }
+  .node.learner   { border-left-color: var(--learner); }
+  .node-head { display: flex; align-items: baseline; gap: var(--s2); margin-bottom: var(--s3); }
+  .node-head b { font-size: var(--t4); font-weight: 600; }
+  .role {
+    font-size: var(--t1); letter-spacing: .1em; text-transform: uppercase; font-weight: 700;
+    margin-left: auto; color: var(--follower);
+  }
+  .leader .role    { color: var(--leader); }
+  .candidate .role { color: var(--candidate); }
+  .down .role      { color: var(--down); }
+  .learner .role   { color: var(--learner); }
+
+  /* value tables: label dim and small, value bright. Hierarchy without color. */
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: var(--s1) 0; vertical-align: baseline; }
+  td:first-child { color: var(--ink-dim); font-size: var(--t2); padding-right: var(--s3); }
+  td:last-child  { text-align: right; font-variant-numeric: tabular-nums; }
+  .sub { margin-top: var(--s3); padding-top: var(--s3); border-top: 1px solid var(--line); }
+
+  details > summary {
+    cursor: pointer; color: var(--ink-dim); font-size: var(--t2);
+    padding: var(--s2) 0;
+    list-style: none;
+  }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::before { content: "▸ "; }
+  details[open] > summary::before { content: "▾ "; }
+  details > summary:hover { color: var(--ink); }
+
+  /* The state machine is the one block whose length is set by the DATA, not the design:
+     empty at rest, hundreds of rows after a flood. Capped and scrolled so a card is the
+     same size either way, and the cluster stays comparable across three cards. ~14 rows
+     at the row height above, which is enough to read a page without dominating the card.
+     A faint inset edge marks it as a viewport rather than a list that happens to end. */
+  .kvscroll {
+    max-height: 15rem;
+    overflow-y: auto;
+    overscroll-behavior: contain;   /* stops the page scrolling once the list bottoms out */
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+  .kvscroll::-webkit-scrollbar { width: 8px; }
+  .kvscroll::-webkit-scrollbar-thumb { background: var(--line-hi); border-radius: 4px; }
+  .kvscroll { scrollbar-width: thin; scrollbar-color: var(--line-hi) transparent; }
+  /* Long values must not widen the card and break the three-across layout. */
+  .kvscroll td:last-child { overflow-wrap: anywhere; }
+
+  /* ---------- controls ---------- */
+  .ctl { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
+  .ctl + .ctl { margin-top: var(--s3); }
+  input, button, select {
+    font: inherit;
+    background: var(--raised);
+    color: var(--ink);
+    border: 1px solid var(--line-hi);
+    border-radius: 4px;
+    padding: var(--s2) var(--s3);
+  }
+  input { min-width: 0; flex: 1 1 7rem; }
+  input::placeholder { color: var(--ink-dim); }
+  button { cursor: pointer; white-space: nowrap; box-shadow: var(--shadow-sm); }
+  button:hover  { border-color: var(--ink-dim); }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--follower); border-color: var(--follower); color: #06121f; font-weight: 600; }
+  button.primary:hover { background: #79b8ff; }
+  button.danger { color: #ffb4ae; border-color: #6e2b28; }
+  button.danger:hover { background: #3d1d1b; border-color: var(--down); }
+  button.cut { color: #ffc59a; border-color: #6b3a17; }
+  button.cut:hover { background: #3a2312; border-color: var(--cut); }
+  :focus-visible { outline: 2px solid var(--follower); outline-offset: 2px; }
+
+  .node-actions { display: flex; gap: var(--s2); margin-top: var(--s3); }
+  .node-actions button { flex: 1; font-size: var(--t2); padding: var(--s1) var(--s2); }
+
+  #status { font-size: var(--t2); color: var(--ink-dim); min-height: 1.2em; }
+  #status.ok  { color: var(--leader); }
+  #status.err { color: var(--down); }
+
+  /* ---------- event feed ---------- */
+  .chips { display: flex; flex-wrap: wrap; gap: var(--s1); padding: var(--s2) var(--s4); }
+  .fchip {
+    font: 600 var(--t1)/1.4 var(--mono);
+    letter-spacing: .06em; text-transform: uppercase;
+    padding: var(--s1) var(--s2);
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    color: var(--ink-dim);
+    box-shadow: none;
+  }
+  .fchip:hover { color: var(--ink); border-color: var(--line-hi); }
+  .fchip[aria-pressed="true"] {
+    color: var(--follower); border-color: var(--follower); background: var(--raised);
+  }
+  .fchip .n { color: var(--ink-dim); font-weight: 400; margin-left: var(--s1); }
+  .fchip[aria-pressed="true"] .n { color: var(--follower); }
+  #log { max-height: 420px; overflow-y: auto; padding: var(--s2) 0; }
+  .ev {
+    display: grid;
+    grid-template-columns: 4.6rem 5rem 1fr;
+    gap: var(--s2);
+    padding: var(--s1) var(--s4);
+    font-size: var(--t2);
+    white-space: nowrap;
+  }
+  .ev:hover { background: var(--raised); }
+  .ev time { color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+  .ev .who { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+  .ev .what { overflow: hidden; text-overflow: ellipsis; }
+  .ev .what em { font-style: normal; color: var(--ink-dim); }
+  .ev.hot .what { color: var(--leader); }
+  .ev.vote .what { color: var(--candidate); }
+  .ev.bad .what { color: var(--down); }
+  .empty { padding: var(--s5) var(--s4); color: var(--ink-dim); font-size: var(--t2); text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>raftkv</h1>
+  <span class="label">replicated key-value store</span>
+  <div id="health"></div>
+</header>
+
+<div class="grid">
+
+  <!-- LEFT: what the cluster is doing, then each node in detail -->
+  <div class="stack">
+
+    <section class="panel">
+      <header>
+        <span class="label">cluster topology</span>
+        <span class="label" id="topo-note" style="margin-left:auto"></span>
+      </header>
+      <canvas id="topo" width="900" height="300"></canvas>
+      <div class="legend">
+        <span class="key"><i style="background:var(--leader)"></i>leader</span>
+        <span class="key"><i style="background:var(--follower)"></i>follower</span>
+        <span class="key"><i style="background:var(--candidate)"></i>candidate</span>
+        <span class="key"><i style="background:var(--learner)"></i>learner (non-voting)</span>
+        <span class="key"><i style="background:var(--down)"></i>unreachable</span>
+        <span class="key"><i style="background:var(--cut)"></i>partitioned link</span>
+      </div>
+    </section>
+
+    <section>
+      <div class="label" style="margin-bottom:var(--s3)">nodes</div>
+      <div id="nodes"></div>
+    </section>
+
+
+  </div>
+
+  <!-- RIGHT: context and controls stay in view while you act on the left -->
+  <div class="stack">
+
+    <section class="panel">
+      <header><span class="label">system</span></header>
+      <div class="body"><table id="system"></table></div>
+    </section>
+
+    <section class="panel">
+      <header><span class="label">control</span></header>
+      <div class="body">
+        <!-- Deliberately not a form element: a submit event navigates the page away
+             unless every handler cooperates, and this page shares its DOM with
+             whatever extensions the browser has installed. -->
+        <div class="ctl">
+          <input id="key" placeholder="key" autocomplete="off">
+          <input id="value" placeholder="value" autocomplete="off">
+        </div>
+        <div class="ctl">
+          <button id="setbtn" type="button" class="primary">set on leader</button>
+          <button id="delbtn" type="button">delete</button>
+        </div>
+        <div class="ctl"><span id="status"></span></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <header>
+        <span class="label">event feed</span>
+        <span class="label" style="margin-left:auto">newest first</span>
+      </header>
+      <div id="feed-filters" class="chips"></div>
+      <div id="log"></div>
+    </section>
+
+  </div>
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const ADDR_SHAPE = /^[A-Za-z0-9.-]+:\d+$/;
+// 127.0.0.1, not "localhost": localhost resolves to either 127.0.0.1 or ::1, and if a
+// second cluster is listening (compose publishes [::]:800N while a local node binds
+// 127.0.0.1:800N) the tab silently polls whichever one DNS picked.
+let NODES = (params.get("nodes")
+  || "127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003").split(",")
+  .filter(a => ADDR_SHAPE.test(a));
+
+/* Addresses to probe for nodes that exist but are in nobody's configuration. Nothing
+   in /state can reveal them -- that is what "not a member" means -- so the only way to
+   see one is to knock. Probed rather than seeded into NODES: an address that has never
+   answered cannot be classified, and a 3-node deployment showing two permanent
+   unreachable cards is worse than not knowing. An explicit ?nodes= turns this off. */
+
+const states = {};        // addr -> NodeState | null
+const OPEN_DETAILS = new Set();   // <details> is rebuilt every tick; keep open state outside the DOM
+const SCROLL_POS = new Map();     // ...and so is the scroll position inside it
+const pulses = [];        // live replication pulses on the topology graph
+let lastEventTs = 0;
+
+/* ================= data ================= */
+
+async function poll(addr) {
+  try {
+    const r = await fetch(`http://${addr}/state`, {signal: AbortSignal.timeout(900)});
+    // A crashed node answers 503 with a JSON body: without the r.ok check that body
+    // would render as a live card with every field undefined.
+    states[addr] = r.ok ? await r.json() : null;
+  } catch { states[addr] = null; }
+}
+
+function byId() {
+  const map = {};
+  for (const [addr, s] of Object.entries(states)) if (s) map[s.node_id] = {addr, s};
+  return map;
+}
+
+function memberAddrs() { return NODES; }
+
+/* --- leader selection --------------------------------------------------------------
+   The first node reporting itself leader wins. */
+
+function leaderEntry() {
+  for (const [addr, s] of Object.entries(states)) {
+    if (s && s.role === "leader") return {addr, s};
+  }
+  return null;
+}
+
+function leaderAddr() {
+  const best = leaderEntry();
+  return best ? best.addr : null;
+}
+
+/* How many voters can this leader still reach, itself included? A cut is bidirectional
+   (raft.py set_blocked skips outbound, app.py refuse_if_partitioned drops inbound), so
+   either side naming the other severs the link. "nodes up" cannot answer this: all three
+   nodes are up in a clean partition, and counting them calls an isolated leader healthy. */
+function quorumReach(leader) {
+  if (!leader) return 0;
+  let n = 1;  // a leader always has its own vote
+  for (const s of Object.values(states)) {
+    if (!s || s.learner || s.node_id === leader.node_id) continue;
+    if (leader.blocked?.includes(s.node_id) || s.blocked?.includes(leader.node_id)) continue;
+    n++;
+  }
+  return n;
+}
+/* --- end leader selection --------------------------------------------------------- */
+
+/* ================= rendering helpers ================= */
+
+// Rendering builds DOM nodes via textContent -- no HTML sink, so no XSS.
+function el(tag, className, text) {
+  const n = document.createElement(tag);
+  if (className) n.className = className;
+  if (text !== undefined) n.textContent = String(text);
+  return n;
+}
+
+// This page polls forever, so it has to survive anything that mutates the DOM out
+// from under it -- browser extensions inject into pages and have been seen removing
+// sibling nodes. Find-or-recreate instead of throwing twice a second.
+function mount(id) {
+  let n = document.getElementById(id);
+  if (!n) {
+    if (!document.body) document.documentElement.append(document.createElement("body"));
+    n = el("div");
+    n.id = id;
+    document.body.append(n);
+  }
+  return n;
+}
+
+function row(label, value) {
+  const tr = document.createElement("tr");
+  tr.append(el("td", "", label), el("td", "", value));
+  return tr;
+}
+
+function setStatus(text, cls) {
+  const s = document.getElementById("status");
+  if (!s) return;
+  s.textContent = text;
+  s.className = cls || "";
+}
+
+/* ================= system summary ================= */
+
+function renderSystem() {
+  // Members only. A staged node is up and answering, and counting it here would put
+  // "nodes up 5/5" beside "quorum 2 of 3" -- inviting the one wrong conclusion this
+  // panel exists to prevent, that a running process is a vote.
+  const members = memberAddrs();
+  const live = members.map(a => states[a]).filter(Boolean);
+  const voters = live.filter(s => !s.learner);
+  const leader = leaderEntry()?.s ?? null;  // highest term, not first seen -- see leaderEntry()
+  const total = members.length;
+  // A joint configuration seen on ANY node means the transition is live: config takes
+  // effect on append, so nodes legitimately disagree about it for a moment.
+  const joint = live.map(s => s.config).find(c => c && c.old_voters
+    && Object.keys(c.old_voters).length);
+  const votingTotal = voters.length + (total - live.length);  // unreachable count as voters
+  const quorum = Math.floor(votingTotal / 2) + 1;
+  const cut = live.reduce((n, s) => n + (s.blocked?.length || 0), 0);
+
+  // Health strip: the four things you would check first, in the order you would ask.
+  const strip = mount("health");
+  strip.replaceChildren(...[
+    ["nodes up", `${live.length}/${total}`, live.length < quorum ? "bad" : live.length < total ? "warn" : ""],
+    // "of N voting", not "of N": with a learner attached the strip otherwise reads
+    // "nodes up 4/4" beside "quorum 2 of 3" and invites exactly the wrong question.
+    // The learner is up and replicating; it is simply not in the majority.
+    // During a joint transition one number is a lie: agreement needs a majority of
+    // BOTH configurations, so show both requirements rather than averaging them away.
+    joint
+      ? ["quorum", `${Math.floor(Object.keys(joint.old_voters).length / 2) + 1}`
+          + ` of ${Object.keys(joint.old_voters).length} old`
+          + ` AND ${Math.floor(Object.keys(joint.voters).length / 2) + 1}`
+          + ` of ${Object.keys(joint.voters).length} new`, "warn"]
+      : ["quorum", `${quorum} of ${votingTotal} voting`, ""],
+    ["leader", leader ? leader.node_id : "none", leader ? "" : "bad"],
+    // Reachability, not headcount. A partitioned leader is up, and so is everyone it
+    // can no longer talk to, so `live.length >= quorum` reads "accepting" while every
+    // submit() on that node is already destined to time out uncommitted.
+    ["writes", leader && quorumReach(leader) >= quorum ? "accepting" : "unavailable",
+      leader && quorumReach(leader) >= quorum ? "" : "bad"],
+  ].map(([k, v, cls]) => {
+    const d = el("div", "stat" + (cls ? " " + cls : ""));
+    d.append(el("span", "label", k), el("b", "num", v));
+    return d;
+  }));
+
+  // Detail table: agreement is the interesting part, so it leads.
+  const terms = new Set(live.map(s => s.term));
+  const commits = new Set(voters.map(s => s.commit_index));
+  const t = mount("system");
+  t.replaceChildren(
+    row("term", terms.size === 1 ? [...terms][0] : `split (${[...terms].sort((a,b)=>a-b).join(", ")})`),
+    row("committed index", commits.size === 1 ? [...commits][0] : `diverged (${[...commits].sort((a,b)=>a-b).join(", ")})`),
+    row("replicated keys", leader ? Object.keys(leader.kv).length : "?"),
+    // The LEADER's learner map is authoritative. Counting nodes that self-report as
+    // learners only finds the ones this tab happens to be polling, so a learner the
+    // leader is replicating to reads as zero here the moment it drops off the list.
+    row("configuration", joint
+      ? `JOINT ${Object.keys(joint.old_voters).length} -> ${Object.keys(joint.voters).length}`
+      : `${votingTotal} voters, tolerates ${votingTotal - quorum}`),
+    row("learners", leader ? Object.keys(leader.learners ?? {}).length
+                           : live.filter(s => s.learner).length),
+    row("partitioned links", cut),
+    row("elections", live.reduce((n, s) => n + s.metrics.elections_started, 0)),
+    row("rpc failures", live.reduce((n, s) => n + s.metrics.rpc_failures, 0)),
+    row("build", buildSummary()),
+  );
+
+  const note = document.getElementById("topo-note");
+  if (note) {
+    note.textContent = joint
+      ? "joint consensus in flight — both majorities required"
+      : leader ? `term ${leader.term}` : "no leader";
+    note.style.color = joint ? "var(--candidate)" : "";
+  }
+}
+
+/* ================= topology canvas =================
+   Canvas, not SVG or a 3D scene: a handful of nodes on a ring reads better flat,
+   and the page stays zero-dependency and offline, which is a load-bearing property
+   of this page (it is served from inside the container).                        */
+
+function nodePositions(w, h) {
+  // The graph is the CLUSTER, so staged nodes are not on it. They have no edges to
+  // draw: nobody replicates to them and they vote for nobody.
+  const ids = memberAddrs().map(addr => ({addr, s: states[addr]}));
+  const cx = w / 2, cy = h / 2;
+  // An ellipse, not a circle. This panel is more than twice as wide as it is tall,
+  // and a circle sized to the short axis strands two thirds of the canvas empty --
+  // measured at 706x300, a min(w,h) radius used a 198px band of a 706px panel.
+  // Capped at both ends. Uncapped, a 1600px-wide panel flings the nodes to the far
+  // edges around a dead middle, which reads as a broken diagram rather than a spacious
+  // one; the graph is a small object, so let it be small and let the panel breathe.
+  const rx = Math.min(Math.max(90, w * 0.32), 240);
+  const ry = Math.min(Math.max(70, h * 0.30), 95);
+  return ids.map((n, i) => {
+    const a = -Math.PI / 2 + (i * 2 * Math.PI) / ids.length;
+    return {...n, x: cx + rx * Math.cos(a), y: cy + ry * Math.sin(a)};
+  });
+}
+
+function css(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function drawTopology(ts) {
+  const canvas = document.getElementById("topo");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr; canvas.height = h * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const pos = nodePositions(w, h);
+  const byNodeId = {};
+  pos.forEach(p => { if (p.s) byNodeId[p.s.node_id] = p; });
+  // Same highest-term pick as the header, or the graph draws a stale leader's dead
+  // links while the real leader's live ones go unrendered.
+  const elected = leaderEntry();
+  const leader = elected ? byNodeId[elected.s.node_id] : null;
+
+  // Edges: leader to everyone it replicates to. That IS the data flow in Raft;
+  // followers never talk to each other, so a full mesh would be a lie.
+  if (leader) {
+    for (const p of pos) {
+      if (p === leader) continue;
+      const cutHere = leader.s.blocked?.includes(p.s?.node_id)
+                   || p.s?.blocked?.includes(leader.s.node_id);
+      const dead = !p.s;
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(leader.x, leader.y);
+      ctx.lineTo(p.x, p.y);
+      if (cutHere || dead) {
+        ctx.strokeStyle = cutHere ? css("--cut") : css("--down");
+        ctx.setLineDash([4, 5]);
+        ctx.lineWidth = 1.5;
+      } else {
+        ctx.strokeStyle = css("--line-hi");
+        ctx.lineWidth = 1.5;
+      }
+      ctx.stroke();
+      ctx.restore();
+
+      if (cutHere) {  // an X on the wire: the link is severed, not merely quiet
+        const mx = (leader.x + p.x) / 2, my = (leader.y + p.y) / 2;
+        ctx.save();
+        ctx.strokeStyle = css("--cut");
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(mx - 5, my - 5); ctx.lineTo(mx + 5, my + 5);
+        ctx.moveTo(mx + 5, my - 5); ctx.lineTo(mx - 5, my + 5);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+
+  // Pulses: one per real replication event seen in /logs, travelling leader -> peer.
+  for (let i = pulses.length - 1; i >= 0; i--) {
+    const p = pulses[i];
+    const t = (ts - p.t0) / 900;
+    if (t >= 1 || !leader) { pulses.splice(i, 1); continue; }
+    const target = byNodeId[p.to];
+    if (!target) { pulses.splice(i, 1); continue; }
+    const x = leader.x + (target.x - leader.x) * t;
+    const y = leader.y + (target.y - leader.y) * t;
+    ctx.save();
+    ctx.globalAlpha = 1 - t * 0.7;
+    ctx.fillStyle = css("--leader");
+    ctx.beginPath();
+    ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Nodes
+  for (const p of pos) {
+    const s = p.s;
+    const color = !s ? css("--down")
+      : s.learner ? css("--learner")
+      : s.role === "leader" ? css("--leader")
+      : s.role === "candidate" ? css("--candidate")
+      : css("--follower");
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 26, 0, Math.PI * 2);
+    ctx.fillStyle = css("--raised");
+    ctx.fill();
+    ctx.lineWidth = s && s.role === "leader" ? 3 : 2;
+    ctx.strokeStyle = color;
+    if (!s) ctx.setLineDash([3, 3]);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.font = `600 12px ${css("--mono")}`;
+    ctx.textAlign = "center";
+    ctx.fillText(s ? s.node_id : "down", p.x, p.y + 4);
+    ctx.fillStyle = css("--ink-dim");
+    ctx.font = `11px ${css("--mono")}`;
+    ctx.fillText(s ? `${s.log_length}/${s.commit_index}` : p.addr.split(":")[1],
+                 p.x, p.y + 42);
+    ctx.restore();
+  }
+
+  // A quiet caption beats an unexplained diagram.
+  ctx.save();
+  ctx.fillStyle = css("--ink-dim");
+  ctx.font = `11px ${css("--mono")}`;
+  ctx.textAlign = "left";
+  ctx.fillText("log / committed", 10, h - 10);
+  ctx.restore();
+}
+
+/* ================= node cards ================= */
+
+function nodeCard(addr) {
+  const s = states[addr];
+  const card = el("div", "node");
+
+  if (!s) {
+    card.classList.add("down");
+    const head = el("div", "node-head");
+    head.append(el("b", "", addr), el("span", "role", "unreachable"));
+    card.append(head);
+    card.append(el("div", "label", "no response to /state"));
+    return card;
+  }
+
+  card.classList.add(s.learner ? "learner" : s.role);
+  const head = el("div", "node-head");
+  head.append(el("b", "", s.node_id), el("span", "label", addr),
+              el("span", "role", s.learner ? "learner" : s.role));
+  card.append(head);
+
+  const t = document.createElement("table");
+  t.append(
+    row("term", s.term),
+    row("leader", s.leader_id ?? "-"),
+    row("voted for", s.voted_for ?? "-"),
+    row("log / commit / applied", `${s.log_length} / ${s.commit_index} / ${s.last_applied}`),
+  );
+  card.append(t);
+
+  // Infrastructure and metrics are reference, not headline: collapsed by default.
+  card.append(infraDetails(addr, s));
+  return card;
+}
+
+/* `rows` may be a function, and for anything data-sized it should be: a collapsed block
+   renders nothing, so building its rows is work thrown away twice a second. At the
+   generator's ceiling that is 5000 keys x 3 cards x 2/sec of DOM nobody can see.
+
+   Opening one fills its table IN PLACE rather than asking for a re-render. That is not a
+   style preference: assigning `d.open = true` on a rebuilt card is itself a change, so it
+   fires `toggle` too, and a handler that responds by re-rendering would rebuild the card,
+   set open again, fire again -- an unbounded loop running as fast as the event queue
+   allows, every tick, for every block left open. Appending here cannot recurse, and the
+   `hasChildNodes` guard makes a second toggle a no-op instead of a doubled table. */
+function detailsBlock(addr, kind, summary, rows, scrolls) {
+  const key = `${addr}:${kind}`;
+  const d = document.createElement("details");
+  d.open = OPEN_DETAILS.has(key);
+  d.append(el("summary", "", summary));
+  const t = document.createElement("table");
+  const lazy = typeof rows === "function";
+  (lazy ? (d.open ? rows() : []) : rows).forEach(r => t.append(r));
+  d.addEventListener("toggle", () => {
+    d.open ? OPEN_DETAILS.add(key) : OPEN_DETAILS.delete(key);
+    if (d.open && lazy && !t.hasChildNodes()) rows().forEach(r => t.append(r));
+  });
+  if (!scrolls) { d.append(t); return d; }
+  // A flood leaves hundreds of keys. Unbounded, the card grows past the viewport and
+  // pushes the topology graph and every other card off screen -- so the state machine
+  // scrolls inside its own box and the card keeps its size no matter how much data
+  // lands in it. Tagged rather than restored here: scrollTop on a detached element is
+  // dropped, and this subtree is not in the document yet (renderNodes attaches it).
+  const box = el("div", "kvscroll");
+  box.dataset.scrollkey = key;
+  box.append(t);
+  d.append(box);
+  // A collapsed <details> generates no layout box, so restoreScroll's assignment on the
+  // rebuild path is silently dropped while this is shut. Without restoring here too, the
+  // list opens at the top and then jumps to the remembered row up to a tick later, which
+  // on a long list reads as the panel losing your place. The toggle fires after the
+  // subtree is rendered, so by here the assignment sticks.
+  d.addEventListener("toggle", () => {
+    if (!d.open) return;
+    const at = SCROLL_POS.get(key);
+    if (at !== undefined) box.scrollTop = at;
+  });
+  return d;
+}
+
+/* --- scroll persistence (sliced out and run under node by tests/test_dashboard_keys.py) */
+/* Restore every scroll box to where the user left it. Called immediately after the
+   cards are attached, because the whole card subtree is rebuilt twice a second and a
+   scroll position that resets on every tick makes a long list impossible to read at
+   all -- the same reason OPEN_DETAILS lives outside the DOM.
+
+   Keyed by addr:kind, so each node's list holds its own position: the three cards are
+   scrolled independently while comparing what the nodes hold. */
+function restoreScroll(host) {
+  for (const box of host.querySelectorAll("[data-scrollkey]")) {
+    const at = SCROLL_POS.get(box.dataset.scrollkey);
+    // `!== undefined`, not truthiness: 0 is a real position (the user scrolled back to
+    // the top), and treating it as "nothing remembered" leaves the box wherever it
+    // happened to be instead of where they put it.
+    if (at !== undefined) box.scrollTop = at;
+    box.addEventListener("scroll", () =>
+      SCROLL_POS.set(box.dataset.scrollkey, box.scrollTop), {passive: true});
+    // Restoring the POSITION is not the same as surviving the GESTURE. A drag on this
+    // scrollbar -- or a selection across its rows -- ends the moment replaceChildren
+    // removes the element from under the pointer, which is twice a second, so the one
+    // interaction this list exists for is the one the rebuild breaks. Hold the rebuild
+    // while a pointer is down inside it.
+    box.addEventListener("pointerdown", () => { scrollHeldAt = Date.now(); });
+  }
+}
+
+/* Timestamp rather than a boolean, and checked with a deadline below: a missed pointerup
+   (the pointer leaves the window, the browser eats the event) would otherwise freeze the
+   whole dashboard permanently, turning a scrolling nicety into the worst bug on the page.
+   Bounded, the worst case is one stale card for a few seconds. */
+let scrollHeldAt = 0;
+const SCROLL_HOLD_MS = 4000;
+
+function scrollHeld() {
+  return scrollHeldAt !== 0 && Date.now() - scrollHeldAt < SCROLL_HOLD_MS;
+}
+for (const done of ["pointerup", "pointercancel"]) {
+  addEventListener(done, () => { scrollHeldAt = 0; });
+}
+/* --- end scroll persistence -------------------------------------------------------- */
+
+/* --- key ordering (sliced out and run under node by tests/test_dashboard_keys.py) */
+/* The state machine arrives ordered by SQLite's `ORDER BY key`, which is byte order:
+   k1, k10, k100, k11, k2. That is unreadable the moment a flood puts a few hundred keys
+   in the table -- you cannot tell at a glance whether k80 arrived, because it sits
+   nowhere near k79. Numeric runs inside a key therefore compare as NUMBERS.
+
+   Intl.Collator does exactly this natively, so there is no hand-rolled parser to get
+   wrong on the ties that matter (k007 vs k7, k9x vs k10x). The locale is pinned rather
+   than left to the runtime: an unpinned collator sorts by whatever locale the user's
+   browser happens to be in, which would make this untestable and the order unrepeatable. */
+const KEY_ORDER = new Intl.Collator("en", {numeric: true});
+
+function sortedKv(kv) {
+  return Object.entries(kv ?? {}).sort((a, b) => KEY_ORDER.compare(a[0], b[0]));
+}
+/* --- end key ordering ------------------------------------------------------------- */
+
+function infraDetails(addr, s) {
+  const wrap = el("div", "sub");
+
+  const peers = s.peers ?? {}, learners = s.learners ?? {};
+  const topo = [row("this node", s.advertise_addr || addr)];
+  Object.keys(peers).sort().forEach(id =>
+    topo.push(row(id + (s.blocked?.includes(id) ? " (cut)" : ""), peers[id])));
+  Object.keys(learners).sort().forEach(id => topo.push(row(id + " (learner)", learners[id])));
+  // Per-node, because "build MIXED (2)" in the summary is a dead end without it.
+  if (builds[addr]) topo.push(row("build", builds[addr].server));
+  wrap.append(detailsBlock(addr, "infra",
+    `infrastructure · ${Object.keys(peers).length + 1} voting`, topo));
+
+  // The count comes off the raw map, so the summary is honest while collapsed; the rows
+  // themselves are built lazily, only when someone is looking at them.
+  const count = Object.keys(s.kv ?? {}).length;
+  wrap.append(detailsBlock(addr, "kv", `state machine · ${count} keys`,
+    () => count ? sortedKv(s.kv).map(([k, v]) => row(k, v)) : [row("empty", "-")], true));
+
+  wrap.append(detailsBlock(addr, "metrics", "metrics", [
+    row("elections started", s.metrics.elections_started),
+    row("votes granted", s.metrics.votes_granted),
+    row("appends sent", s.metrics.append_entries_sent),
+    row("appends received", s.metrics.append_entries_received),
+    row("rpc failures", s.metrics.rpc_failures),
+  ]));
+  return wrap;
+}
+
+function renderNodes() {
+  // Never rebuild a list someone has hold of -- see scrollHeld(). The cards go stale for
+  // the length of the drag, which is the correct trade: you are reading, not watching.
+  if (scrollHeld()) return;
+  const host = mount("nodes");
+  host.replaceChildren(...memberAddrs().map(nodeCard));
+  restoreScroll(host);  // must follow the attach: scrollTop is dropped while detached
+}
+
+/* ================= event feed ================= */
+
+// Groups double as the feed's filters. "commits" is the one you want while following a
+// write: submitted -> log_appended -> commit_advanced -> applied is the whole story of
+// an entry becoming real, and it is otherwise buried under heartbeat-driven noise.
+const GROUPS = {
+  commits:    new Set(["submitted", "log_appended", "commit_advanced", "applied"]),
+  elections:  new Set(["election_started", "vote_granted", "became_leader", "became_follower"]),
+  membership: new Set(["learner_added", "config_joint", "config_committed", "promoted"]),
+  faults:     new Set(["crashed", "recovered", "reset", "partition_set", "log_truncated",
+                       "task_died", "unhandled_exception"]),
+};
+const HOT = new Set([...GROUPS.commits, "became_leader"]);
+const VOTE = GROUPS.elections;
+const BAD = GROUPS.faults;
+
+let feedFilter = "all";
+let lastLines = [];
+
+function renderFilters(lines) {
+  const host = mount("feed-filters");
+  const counts = {all: lines.length};
+  for (const g of Object.keys(GROUPS)) {
+    counts[g] = lines.filter(e => GROUPS[g].has(e.event)).length;
+  }
+  host.replaceChildren(...["all", ...Object.keys(GROUPS)].map(g => {
+    const b = el("button", "fchip");
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(feedFilter === g));
+    b.append(el("span", "", g), el("span", "n", counts[g]));
+    b.addEventListener("click", () => {
+      feedFilter = g;
+      renderFilters(lastLines);   // repaint immediately, do not wait for the next poll
+      renderFeed(lastLines);
+    });
+    return b;
+  }));
+}
+
+async function refreshLogs() {
+  const lines = [];
+  await Promise.all(NODES.map(async addr => {
+    try {
+      const r = await fetch(`http://${addr}/logs`, {signal: AbortSignal.timeout(900)});
+      if (r.ok) (await r.json()).forEach(e => lines.push(e));
+    } catch {}
+  }));
+  // Newest FIRST: the interesting line is the one that just happened,
+  // and nobody should be scrolling a live feed to find it.
+  lines.sort((a, b) => b.ts - a.ts);
+
+  // Replication events since the last poll become pulses on the graph. This is the
+  // real thing happening, not an idle animation on a timer.
+  const fresh = lines.filter(e => e.ts > lastEventTs);
+  if (lines.length) lastEventTs = lines[0].ts;
+  for (const e of fresh) {
+    if (e.event === "log_appended" && e.node) {
+      pulses.push({to: e.node, t0: performance.now()});
+    }
+  }
+
+  lastLines = lines;
+  renderFilters(lines);
+  renderFeed(lines);
+}
+
+function renderFeed(lines) {
+  const shown = feedFilter === "all"
+    ? lines
+    : lines.filter(e => GROUPS[feedFilter]?.has(e.event));
+  const feed = mount("log");
+  if (!shown.length) {
+    feed.replaceChildren(el("div", "empty",
+      lines.length ? `no ${feedFilter} events yet` : "no events yet"));
+    return;
+  }
+  feed.replaceChildren(...shown.slice(0, 60).map(e => {
+    const cls = "ev" + (HOT.has(e.event) ? " hot" : VOTE.has(e.event) ? " vote"
+      : BAD.has(e.event) ? " bad" : "");
+    const div = el("div", cls);
+    const detail = e.key ?? e.candidate ?? e.peer ?? e.index ?? e.commit_index ?? "";
+    const what = el("span", "what");
+    what.append(el("span", "", e.event ?? e.msg ?? ""), " ", el("em", "", detail));
+    div.append(
+      el("time", "", new Date(e.ts * 1000).toLocaleTimeString()),
+      el("span", "who", `${e.node ?? "?"} t${e.term ?? "?"}`),
+      what,
+    );
+    return div;
+  }));
+}
+
+/* ================= actions ================= */
+
+// Every mutation goes to the node that currently claims leadership; followers answer
+// 503 with a leader_id hint rather than redirecting (decision D14).
+async function sendToLeader(method, key, body, verb) {
+  const addr = leaderAddr();
+  if (!addr) return setStatus("no leader visible", "err");
+  setStatus(`${verb} via ${addr}...`);
+  try {
+    const r = await fetch(`http://${addr}/kv/${encodeURIComponent(key)}`, {
+      method,
+      headers: body ? {"content-type": "application/json"} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!r.ok) {
+      const detail = await r.json().catch(() => ({}));
+      // 503 here means the leader moved between the last poll and this request.
+      setStatus(`error ${r.status} ${detail.error ?? ""}`.trim(), "err");
+      return false;
+    }
+    setStatus(`${verb} committed via ${addr}`, "ok");
+    return true;
+  } catch (e) {
+    setStatus(`${verb} failed: ${e}`, "err");
+    return false;
+  }
+}
+
+async function write() {
+  const k = document.getElementById("key"), v = document.getElementById("value");
+  if (!k || !v) return;
+  const key = k.value.trim();
+  if (!key) return setStatus("key required", "err");
+  // KVWrite.value is min_length=1, so an empty value is a 422. Say so here rather
+  // than surfacing a pydantic error code.
+  if (!v.value) return setStatus("value required", "err");
+  if (await sendToLeader("PUT", key, {value: v.value}, "set")) {
+    k.value = ""; v.value = ""; k.focus();
+  }
+}
+
+async function removeKey() {
+  const k = document.getElementById("key");
+  if (!k) return;
+  const key = k.value.trim();
+  if (!key) return setStatus("key required", "err");
+  if (await sendToLeader("DELETE", key, null, "delete")) { k.value = ""; k.focus(); }
+}
+
+// Failure injection from the browser -- no shell, no docker CLI, no kubectl. The node
+// keeps its process alive only so it can be revived; it refuses every RPC, so its
+// peers experience an ordinary crash and elect around it.
+
+/* ================= loops ================= */
+
+async function tick() {
+  await Promise.all(NODES.map(poll));
+  renderSystem();
+  renderNodes();
+  await refreshLogs();
+}
+
+function frame(ts) {
+  drawTopology(ts);
+  requestAnimationFrame(frame);
+}
+
+document.getElementById("setbtn")?.addEventListener("click", write);
+document.getElementById("delbtn")?.addEventListener("click", removeKey);
+for (const id of ["key", "value"]) {
+  document.getElementById(id)?.addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); write(); }
+  });
+}
+
+tick();
+setInterval(tick, 500);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
