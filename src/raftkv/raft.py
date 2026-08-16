@@ -13,6 +13,8 @@ from raftkv.logging_setup import log_event
 from raftkv.models import (
     AppendEntriesRequest,
     AppendEntriesResponse,
+    Command,
+    LogEntry,
     Metrics,
     NodeState,
     RequestVoteRequest,
@@ -20,9 +22,15 @@ from raftkv.models import (
     Role,
 )
 from raftkv.storage import Storage
-from raftkv.transport import Transport
+from raftkv.transport import Transport, TransportError
 
 logger = logging.getLogger("raftkv.raft")
+
+
+class NotLeaderError(Exception):
+    def __init__(self, leader_id: str | None) -> None:
+        super().__init__(f"not the leader; try {leader_id or 'unknown'}")
+        self.leader_id = leader_id
 
 
 class RaftNode:
@@ -43,7 +51,9 @@ class RaftNode:
         self.metrics = Metrics()
         self._last_reset = time.monotonic()
         self._election_timeout = random.uniform(*cfg.election_timeout_range)
+        self._replicate_now = asyncio.Event()   # submit() nudges the replication loop
         self._apply_ready = asyncio.Event()     # commit-index advances wake the applier
+        self._waiters: dict[int, asyncio.Future[LogEntry]] = {}  # submits awaiting apply
 
     @property
     def quorum(self) -> int:
@@ -135,6 +145,131 @@ class RaftNode:
             self.commit_index = min(req.leader_commit, last_new_entry)
             self._apply_ready.set()
         return AppendEntriesResponse(term=self.current_term, success=True)
+
+    # ---- candidacy (async: every await yields — re-validate state after) ---
+    async def _start_election(self) -> None:
+        self.role = Role.CANDIDATE
+        self.current_term += 1
+        self.voted_for = self.cfg.node_id
+        self.storage.save_term_and_vote(self.current_term, self.voted_for)  # rule 1
+        self.leader_id = None
+        self._reset_election_timer()  # starting an election: legal reset
+        self.metrics.elections_started += 1
+        term_when_started = self.current_term
+        last_term, last_index = self._last_log_position()
+        req = RequestVoteRequest(
+            term=term_when_started, candidate_id=self.cfg.node_id,
+            last_log_index=last_index, last_log_term=last_term,
+        )
+        self._log("election_started")
+
+        async def ask(peer_id: str) -> RequestVoteResponse | None:
+            try:
+                return await self.transport.request_vote(peer_id, req)
+            except TransportError:
+                self.metrics.rpc_failures += 1
+                return None
+
+        votes = 1  # our own
+        if votes >= self.quorum:  # single-node cluster elects itself instantly
+            self._become_leader()
+            return
+        pending = [asyncio.create_task(ask(p)) for p in sorted(self.cfg.peers)]
+        try:
+            for future in asyncio.as_completed(pending):
+                resp = await future
+                if resp is None:
+                    continue
+                self._observe_term(resp.term)
+                # Stale-reply guard: if the world moved while we awaited, stop.
+                if self.role is not Role.CANDIDATE or self.current_term != term_when_started:
+                    return
+                if resp.vote_granted:
+                    votes += 1
+                    if votes >= self.quorum:
+                        self._become_leader()
+                        return
+        finally:
+            for task in pending:
+                task.cancel()
+
+    def _become_leader(self) -> None:
+        self.role = Role.LEADER
+        self.leader_id = self.cfg.node_id
+        last = self.storage.last_log_index()
+        self.next_index = {p: last + 1 for p in self.cfg.peers}
+        self.match_index = {p: 0 for p in self.cfg.peers}
+        self._log("became_leader", quorum=self.quorum)
+        self._replicate_now.set()  # assert leadership with an immediate heartbeat
+
+    # ---- leader replication ------------------------------------------------
+    async def _append_to_peer(self, peer_id: str, term_when_sent: int) -> None:
+        prev_index = self.next_index[peer_id] - 1
+        prev_term = self.storage.term_at(prev_index)
+        if prev_term is None:  # our log shrank under this nextIndex (deposed+truncated)
+            self.next_index[peer_id] = self.storage.last_log_index() + 1
+            return
+        entries = self.storage.entries_from(self.next_index[peer_id])
+        req = AppendEntriesRequest(
+            term=term_when_sent, leader_id=self.cfg.node_id,
+            prev_log_index=prev_index, prev_log_term=prev_term,
+            entries=entries, leader_commit=self.commit_index,
+        )
+        self.metrics.append_entries_sent += 1  # counts sends, not acks
+        try:
+            resp = await self.transport.append_entries(peer_id, req)
+        except TransportError:
+            self.metrics.rpc_failures += 1  # peer down is weather, not an error
+            return
+        self._observe_term(resp.term)
+        # Stale-reply guard (Students' Guide): act only if nothing changed meanwhile.
+        if self.role is not Role.LEADER or self.current_term != term_when_sent:
+            return
+        if resp.success:
+            # matchIndex from the ARGUMENTS WE SENT — never from current state and
+            # never nextIndex - 1 (Students' Guide).
+            self.match_index[peer_id] = prev_index + len(entries)
+            self.next_index[peer_id] = self.match_index[peer_id] + 1
+            self._advance_commit_index()
+        else:
+            self.next_index[peer_id] = max(1, self.next_index[peer_id] - 1)
+            # naive backoff — one step per rejection; swap in
+            # conflictIndex/conflictTerm accelerated backtracking if logs get long.
+
+    def _advance_commit_index(self) -> None:
+        """Rule 3 (§5.4.2 / Figure 8): majorities count only for CURRENT-term
+        entries; older entries commit transitively when a newer one commits."""
+        for candidate_index in range(self.storage.last_log_index(), self.commit_index, -1):
+            if self.storage.term_at(candidate_index) != self.current_term:
+                break  # terms only shrink going backwards; nothing below qualifies
+            acked = 1 + sum(1 for m in self.match_index.values() if m >= candidate_index)
+            if acked >= self.quorum:
+                self.commit_index = candidate_index
+                self._log("commit_advanced", commit_index=candidate_index)
+                self._apply_ready.set()
+                break
+
+    # ---- client path -------------------------------------------------------
+    async def submit(self, cmd: Command) -> None:
+        """Append, replicate, and wait until APPLIED on this node.
+        Raises NotLeaderError (retry at the leader) or TimeoutError."""
+        if self.role is not Role.LEADER:
+            raise NotLeaderError(self.leader_id)
+        self.storage.append([LogEntry(term=self.current_term, command=cmd)])
+        index = self.storage.last_log_index()
+        self._log("submitted", key=cmd.key, op=cmd.op, index=index, request_id=cmd.request_id)
+        waiter: asyncio.Future[LogEntry] = asyncio.get_running_loop().create_future()
+        self._waiters[index] = waiter
+        self._advance_commit_index()  # a single-node cluster commits immediately
+        self._replicate_now.set()
+        try:
+            applied = await asyncio.wait_for(waiter, timeout=self.cfg.commit_timeout)
+        finally:
+            self._waiters.pop(index, None)
+        # Students' Guide "re-appearing index": another leader may have filled this
+        # index with a different entry. Trust the request_id, not the index.
+        if applied.command.request_id != cmd.request_id:
+            raise NotLeaderError(self.leader_id)
 
     # ---- introspection -----------------------------------------------------
     def state(self) -> NodeState:

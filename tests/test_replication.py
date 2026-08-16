@@ -1,0 +1,96 @@
+import pytest
+from mockito import ANY
+
+from conftest import StubTransport
+from raftkv.models import (
+    AppendEntriesRequest,
+    AppendEntriesResponse,
+    Command,
+    LogEntry,
+    Role,
+)
+from raftkv.raft import NotLeaderError
+
+
+def entry(term: int, rid: str = "r") -> LogEntry:
+    return LogEntry(term=term, command=Command(op="set", key="k", value="v", request_id=rid))
+
+
+def as_leader(node, term=1):
+    node.current_term = term
+    node._become_leader()
+    return node
+
+
+async def test_success_updates_match_index_from_sent_args(make_node, when):
+    transport = StubTransport()
+    node = as_leader(make_node(transport=transport))
+    node.storage.append([entry(1, "a"), entry(1, "b")])
+    node.next_index["node-2"] = 1  # follower far behind; leader sends both entries
+    when(transport).append_entries("node-2", ANY(AppendEntriesRequest)).thenReturn(
+        AppendEntriesResponse(term=1, success=True)
+    )
+    await node._append_to_peer("node-2", term_when_sent=1)
+    # prev(0) + the 2 entries we actually sent, FROM THE SENT ARGS
+    assert node.match_index["node-2"] == 2
+    assert node.next_index["node-2"] == 3  # match + 1
+
+
+async def test_failure_backs_off_next_index(make_node, when):
+    transport = StubTransport()
+    node = as_leader(make_node(transport=transport))
+    node.storage.append([entry(1, "a")])
+    node.next_index["node-2"] = 2
+    when(transport).append_entries("node-2", ANY(AppendEntriesRequest)).thenReturn(
+        AppendEntriesResponse(term=1, success=False)
+    )
+    await node._append_to_peer("node-2", term_when_sent=1)
+    assert node.next_index["node-2"] == 1
+    assert node.match_index["node-2"] == 0  # match NEVER derived from nextIndex
+
+
+async def test_higher_term_reply_deposes_leader(make_node, when):
+    transport = StubTransport()
+    node = as_leader(make_node(transport=transport))
+    when(transport).append_entries("node-2", ANY(AppendEntriesRequest)).thenReturn(
+        AppendEntriesResponse(term=9, success=False)
+    )
+    await node._append_to_peer("node-2", term_when_sent=1)
+    assert node.role is Role.FOLLOWER
+    assert node.current_term == 9
+
+
+async def test_transport_error_is_counted_not_raised(make_node, when):
+    from raftkv.transport import TransportError
+
+    transport = StubTransport()
+    node = as_leader(make_node(transport=transport))
+    when(transport).append_entries("node-2", ANY(AppendEntriesRequest)).thenRaise(
+        TransportError("down")
+    )
+    await node._append_to_peer("node-2", term_when_sent=1)  # must not raise
+    assert node.metrics.rpc_failures == 1
+
+
+async def test_never_commits_prior_term_entries_by_counting(make_node):
+    """Figure 8 (§5.4.2): an old-term entry on a majority must NOT commit directly."""
+    node = make_node()
+    node.storage.append([entry(1, "old")])
+    node.current_term = 2
+    node._become_leader()
+    node.match_index = {"node-2": 1, "node-3": 0}  # majority holds index 1
+    node._advance_commit_index()
+    assert node.commit_index == 0  # rule 3 held
+    # a current-term entry replicated to the same majority commits BOTH
+    node.storage.append([entry(2, "new")])
+    node.match_index = {"node-2": 2, "node-3": 0}
+    node._advance_commit_index()
+    assert node.commit_index == 2
+
+
+async def test_submit_rejects_non_leader(make_node):
+    node = make_node()
+    with pytest.raises(NotLeaderError):
+        await node.submit(Command(op="set", key="k", value="v", request_id="r"))
+
+
