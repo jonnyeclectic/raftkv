@@ -87,12 +87,16 @@ Per-node builds are under each card's **infrastructure** section.
 | `tests/test_debug_entrypoint.py` | The IDE debug entrypoint, which nobody runs in CI and everybody runs before stepping through node-1 |
 | `tests/test_dashboard_leader.py` | The dashboard's leader pick, run under node: highest term wins over first-seen, and `writes` counts reachable voters rather than live ones |
 | `tests/test_dashboard_staged.py` | The member-vs-staged split, run under node: a process in nobody's configuration is drawn as unattached, an attached learner is not, and a crashed member never reclassifies itself out of the cluster |
+| `tests/test_dashboard_probe.py` | The probe list, run under node: `?probe=` extends it to a node provisioned while the page is open, a bare port means loopback, and anything that is not `host:port` is dropped rather than fetched twice a second forever |
+| `tests/test_dashboard_adopt.py` | Membership adoption, run under node: members are picked up from the configuration they replicate (so a page reload keeps them), while a peer-only address like `raft-node-4:8000` is never adopted into a card the browser cannot reach |
+| `tests/test_dashboard_discover.py` | The discovery tick against a stubbed, deliberately out-of-order network: cards are ordered by the probe list rather than by who answered first, and no address is ever adopted twice |
 | `tests/test_dashboard_flood.py` | The flood panel's wording and tint, run under node: failures are named and go amber even when the run completed, and a cancelled flood never reads as done |
 | `tests/test_dashboard_keys.py` | The state machine's key display, run under node: numeric runs sort as numbers (`k8` before `k79` before `k80`), and a scroll position survives the 500 ms card rebuild |
 | `tests/test_build_stamp.py` | Build stamps: `ui` tracks the file per request, `srv` stays frozen at import, injection leaves no placeholder, and a mixed-build cluster is named |
 | `scripts/smoke.sh` | End-to-end check against a running compose cluster |
 | `scripts/clean_start_check.sh` | THE clean-start gate: the compose path works from absolutely clean state |
-| `scripts/run_local.sh` | Starts nodes 2–3 locally so node-1 can run under the IDE debugger |
+| `scripts/run_local.sh` | Starts nodes 2–3 locally (plus idle 4–5) so node-1 can run under the IDE debugger |
+| `scripts/node_up.sh` | Provisions one more staged process mid-demo — the run-local analogue of `kubectl scale` |
 | `scripts/debug_node.py` | The IDE debug target for node-1 (a script, not `-m uvicorn` — see its docstring) |
 | `Dockerfile` | `python:3.14-slim`, non-root user, uvicorn entrypoint |
 | `docker-compose.yml` | Three voting nodes on 8001–8003 plus an idle learner on 8004, healthchecks, named volumes |
@@ -124,7 +128,13 @@ Per-node builds are under each card's **infrastructure** section.
 - `make down` — stop the cluster and delete its volumes
 - `make smoke` — end-to-end smoke test against the running cluster
 - `make clean-start-check` — the clean-start gate: everything works from clean state
-- `make run-local` — nodes 2–3 locally (plus idle 4–5); you run node-1 under the debugger
+- `make run-local` — nodes 2–3 locally (plus idle 4–5); you run node-1 under the debugger.
+  Replication, growth, failover, partitions and load all run against this one cluster
+  without shelling out to `docker` or `kubectl`; see [Running locally](#running-locally)
+- `make node-up N=6` — provision one more process mid-demo, the run-local analogue of
+  `kubectl scale`. It comes up **staged**: attach and promote it from the dashboard
+- `make demo-reset` — **destructive**: stops local nodes and deletes `data/` and `logs/`.
+  The way back to a known-good starting state between runs
 - `make k8s-demo` — kind cluster + StatefulSet variant. **Run this first**: the other
   `k8s-*` targets need the cluster it creates, and refuse with one line if it is absent
   (kubectl's own failure here is a `localhost:8080 connection refused` that reads like a

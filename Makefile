@@ -1,4 +1,4 @@
-.PHONY: install test lint demo down smoke clean-start-check run-local
+.PHONY: install test lint demo down smoke clean-start-check run-local node-up demo-reset
 install:
 	uv sync --all-extras
 test:
@@ -16,6 +16,22 @@ clean-start-check:
 	./scripts/clean_start_check.sh
 run-local:
 	./scripts/run_local.sh
+# Provision one more PROCESS while the cluster runs — the run-local answer to
+# `kubectl scale`. It comes up staged (learner, no peers, empty voter set); attaching
+# and promoting it from the dashboard is what makes it a member. N defaults to 6
+# because run_local.sh already starts 4 and 5.
+node-up:
+	@./scripts/node_up.sh $(or $(N),6)
+# DESTRUCTIVE, and the fastest way back to a known-good starting state: stops every local
+# node and deletes every database and log. `data/` and `logs/` are gitignored build
+# products, so nothing here is recoverable and nothing here needs to be. Use it between
+# runs — a half-grown 5-voter cluster left behind by the last one is state the next one
+# silently inherits.
+demo-reset:
+	-@pkill -f 'raftkv.app' 2>/dev/null || true
+	-@pkill -f 'create_app --port' 2>/dev/null || true
+	rm -rf data logs
+	@echo "clean. now: make run-local, then start node-1 in the IDE debugger"
 
 # kindest/node:v1.33.1 pinned deliberately: v1.36.1 (kind's current default) fails
 # to boot on this project's dev machine ("could not find a log line that matches
