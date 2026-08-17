@@ -1,0 +1,100 @@
+name: nightly
+
+# The cold-start gate, on a timer.
+#
+# `make clean-start-check` is what proves the cluster still comes up from absolutely
+# nothing — no cache, no image, no volumes. Left to a human it is only as good as the
+# person who remembers to run it, and the failure it catches — "works on the machine
+# that built it" — is by definition invisible on that machine. So it runs every night,
+# from a cold runner with no cache and no image, and the answer is known by morning.
+#
+# It is deliberately NOT part of the pull-request gate: a no-cache rebuild takes
+# minutes that every PR would pay, to re-answer a question the cached build already
+# answered. Nightly is the right cadence for "does this still work from nothing".
+
+on:
+  schedule:
+    # 06:00 UTC — before the working day in every timezone this project is reviewed in.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.12.1"
+  PYTHON_VERSION: "3.14"
+  NODE_VERSION: "24"
+
+jobs:
+  clean-start:
+    name: clean start from nothing
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: make clean-start-check
+        # Removes containers, volumes and local images; rebuilds with --no-cache;
+        # starts; runs the full smoke; tears down. The same script a human runs.
+        run: make clean-start-check
+
+      - name: capture cluster logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps > compose-logs.txt || true
+
+      - name: keep them
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-compose-logs
+          path: compose-logs.txt
+          retention-days: 14
+
+      - name: tear down
+        if: always()
+        run: docker compose down --volumes --remove-orphans || true
+
+  portability:
+    name: tests (${{ matrix.os }})
+    # The suite's safety argument rests on asyncio running rule methods to completion
+    # on one event loop, and on SQLite's durability guarantees. Both are platform
+    # behaviour. This is developed on macOS and shipped on Linux, so both are
+    # worth knowing about — nightly rather than per-PR, because a slower runner makes
+    # the real-timer election tests the flakiest thing in the suite and a flaky gate
+    # is worse than no gate.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: install
+        run: uv sync --all-extras --frozen
+
+      - name: pytest
+        run: uv run pytest -o addopts="" -rs

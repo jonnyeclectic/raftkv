@@ -1,0 +1,32 @@
+version: 2
+
+# Pinning every action to a commit SHA is what makes a tag-move attack a no-op. It also
+# means nothing ever updates on its own, which is the bill that comes with the benefit.
+# Dependabot is how that bill gets paid: it bumps the SHA *and* the `# vX.Y.Z` comment
+# beside it in the same commit, so the pin and the human-readable version never drift.
+#
+# Python dependencies are deliberately NOT here. They are exact-pinned in pyproject.toml,
+# resolved into uv.lock, and exported into the hash-checked requirements.lock the image
+# installs from. Dependabot updates the first of those three and not the other two, so
+# every such pull request would fail the `provenance` gate in ci.yml on a stale lock.
+# `make relock` is the supported path; see docs/CI.md.
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    # Wait a week before proposing anything newly published. Most compromised releases
+    # are found and yanked within days, and nothing here is urgent enough to be the
+    # first repository to run a brand-new version of an action.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci"
+    groups:
+      # One pull request per week for all of them. Five separate SHA bumps is five runs
+      # of a gate that takes twenty minutes, to review changes nobody reads separately.
+      actions:
+        patterns: ["*"]

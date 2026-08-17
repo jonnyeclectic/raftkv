@@ -49,9 +49,13 @@ Per-node builds are under each card's **infrastructure** section.
 | Path | Responsibility |
 |---|---|
 | `pyproject.toml` | Project metadata, exact dependency pins, pytest + ruff config |
-| `Makefile` | `install` / `test` / `lint` / `demo` / `smoke` / `clean-start-check` / `run-local` / `k8s-*` targets |
+| `Makefile` | `install` / `test` / `lint` / `gate` / `locks` / `demo` / `smoke` / `clean-start-check` / `run-local` / `k8s-*` targets |
 | `.gitignore` | Keeps DBs, logs, caches, and pre-existing scratch files out of the repo |
-| `.github/workflows/ci.yml` | CI: lint + unit tests, and the compose smoke test |
+| `.github/workflows/ci.yml` | The merge gate: lint, workflow security audit, the suite with **zero skips allowed**, lockfile agreement, image build + CVE scan, compose smoke with a live PII check, CodeQL, dependency review — aggregated into the one required check, `gate` |
+| `.github/workflows/nightly.yml` | The clean-start gate on a timer: `clean-start-check` from a cold runner, plus the suite on ubuntu **and** macOS |
+| `.github/workflows/release.yml` | Tag → verify → scan → GHCR, with an SBOM and a Sigstore build-provenance attestation. The publish step runs in an environment, so a required reviewer is a settings change rather than a code change |
+| `.github/dependabot.yml` | Weekly, grouped, 7-day cooldown bumps of the SHA-pinned actions — the bill that comes with pinning |
+| `.github/rulesets/main.json` | Branch protection as a reviewable file: `gate` required, linear history, no force-push, no deletion |
 | `src/raftkv/__init__.py` | Package marker |
 | `src/raftkv/models.py` | ALL shared Pydantic shapes: commands, **configuration entries**, no-ops, log entries, RPCs, metrics, `NodeState` |
 | `src/raftkv/config.py` | `NodeConfig` + env parsing; validates timing ratios (heartbeat ≪ election) |
@@ -105,6 +109,7 @@ Per-node builds are under each card's **infrastructure** section.
 | `scripts/run_local.sh` | Starts nodes 2–3 locally (plus idle 4–5) so node-1 can run under the IDE debugger |
 | `scripts/node_up.sh` | Provisions one more staged process mid-demo — the run-local analogue of `kubectl scale` |
 | `scripts/debug_node.py` | The IDE debug target for node-1 (a script, not `-m uvicorn` — see its docstring) |
+| `scripts/check_locks.sh` | Both directions of the two-lockfile check, run identically by `make locks` and by CI |
 | `Dockerfile` | `python:3.14-slim`, non-root user, uvicorn entrypoint |
 | `docker-compose.yml` | Three voting nodes on 8001–8003 plus an idle learner on 8004, healthchecks, named volumes |
 | `k8s/raftkv.yaml` | StatefulSet + headless Service (stable peer DNS) for kind |
@@ -132,6 +137,12 @@ Per-node builds are under each card's **infrastructure** section.
 - `make install` — `uv sync --all-extras`
 - `make test` — full pytest suite
 - `make lint` — ruff over src and tests
+- `make gate` — `lint` + `locks` + `test`: every gate `ci.yml` runs that needs no Docker.
+  The two that do are `make smoke` and `make clean-start-check`, and CI runs those same
+  scripts rather than a re-implementation of them
+- `make locks` — `uv.lock` still matches `pyproject.toml`, and `requirements.lock` (what
+  the image installs, hash-checked) still matches `uv.lock`
+- `make relock` — regenerate both lockfiles after a dependency change. Commit them together
 - `make demo` — build + start the three-node compose cluster, dashboard on :8001
 - `make down` — stop the cluster and delete its volumes
 - `make smoke` — end-to-end smoke test against the running cluster
@@ -157,3 +168,4 @@ Per-node builds are under each card's **infrastructure** section.
 - [docs/RAFT.md](docs/RAFT.md) — plain-language Raft walkthrough with sequence diagrams
 - [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md) — handled failures and deliberate omissions, as tables
 - [docs/OVERVIEW.md](docs/OVERVIEW.md) — how this addresses the assignment; decision log with evidence
+- [docs/CI.md](docs/CI.md) — what each CI job gates, and why exactly one status check is required

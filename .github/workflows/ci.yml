@@ -1,22 +1,381 @@
 name: ci
+
+# THE GATE.
+#
+# Everything a reviewer, a container registry or a running cluster depends on is proved here,
+# and exactly one check — `gate` — is what branch protection requires. That indirection
+# is load-bearing, not decoration: GitHub reports a *skipped* job as a passing required
+# check, so a required check that can be skipped is not required at all. `gate` is the
+# one job that can never be skipped, and it decides for itself which of its dependencies
+# were allowed to skip. docs/CI.md is the long form.
+#
+# Every third-party action is pinned to a full commit SHA. A tag is a mutable pointer:
+# the March 2025 tj-actions/changed-files compromise moved published tags to a malicious
+# commit, and every workflow tracking `@v35` executed it on the next run. The `# vX.Y.Z`
+# comment beside each SHA is for humans and for Dependabot, which bumps both together.
+
 on:
-  push: { branches: [main] }
+  push:
+    branches: [main]
   pull_request:
+  merge_group: # the merge queue re-runs the same gate against the merged result
+  workflow_dispatch:
+
+# Least privilege, expressed as zero and granted back per job. A workflow with no
+# `permissions:` block inherits the repository default — historically read/write on
+# everything — which is the largest blast radius a single compromised step can have.
+permissions: {}
+
+# One in-flight run per ref. Superseded pull-request runs are cancelled to keep the
+# queue short; `main` and the merge queue are never cancelled, because their results
+# are the thing protecting the branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned so a runner upgrade cannot change the resolver underneath a green build.
+  UV_VERSION: "0.12.1"
+  PYTHON_VERSION: "3.14"
+  # Node is not optional here — see the `test` job.
+  NODE_VERSION: "24"
+
 jobs:
+  # ---------------------------------------------------------------- static analysis
+  static:
+    name: lint + workflow audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The default leaves a usable GITHUB_TOKEN in .git/config for the whole job,
+          # where any later step (or anything it shells out to) can read it.
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: install
+        run: uv sync --all-extras --frozen
+
+      - name: ruff
+        # --output-format=github turns findings into inline annotations on the diff
+        # instead of a log the reviewer has to go looking for.
+        run: uv run ruff check --output-format=github .
+
+      - name: zizmor — static analysis of these workflows
+        # The pipeline audits itself. zizmor is the Actions-specific linter for the
+        # failure modes this file is written against: expression injection into `run:`,
+        # unpinned actions, over-broad permissions, credential persistence, cache
+        # poisoning. Pinned to an exact release for the same reason the actions are.
+        env:
+          GH_TOKEN: ${{ github.token }} # lets the online audits run instead of skipping
+        run: uvx zizmor==1.29.0 .github/workflows/
+
+  # ---------------------------------------------------------------------- unit tests
   test:
+    name: tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with: { python-version: "3.14" }
-      - run: uv sync --all-extras
-      - run: uv run ruff check .
-      - run: uv run pytest
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: node, because 99 tests silently vanish without it
+        # The dashboard suite slices blocks out of the shipped dashboard.html and
+        # executes them under node; every one of those files is
+        # `skipif(shutil.which("node") is None)`. On a runner without node the suite
+        # still reports success, one whole layer lighter. Installing node is half the
+        # fix — the assertion below is the other half.
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: install
+        run: uv sync --all-extras --frozen
+
+      - name: pytest
+        # -o addopts="" drops the project's own -q. Adding a second -q gives -qq, which
+        # suppresses the pass/fail summary line — the one line CI logs exist for.
+        run: uv run pytest -o addopts="" -rs --junit-xml=junit.xml
+
+      - name: no test may skip
+        # A skip is how a whole layer of this suite disappears without anything going
+        # red. There is exactly one conditional skip in the repo (node absent), the step
+        # above removes that condition, and this asserts the removal worked.
+        run: |
+          python3 - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("junit.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          n, skipped = int(suite.get("tests")), int(suite.get("skipped"))
+          print(f"{n} tests collected, {skipped} skipped")
+          if skipped:
+              print("FAIL: a test skipped in CI. Skips hide missing coverage; see docs/CI.md.")
+              sys.exit(1)
+          if n < 300:
+              print(f"FAIL: only {n} tests collected — collection is broken, not the suite.")
+              sys.exit(1)
+          PY
+
+      - name: keep the report when it is worth reading
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: junit-report
+          path: junit.xml
+          retention-days: 7
+
+  # ------------------------------------------------------------ dependency provenance
+  provenance:
+    name: lockfile agreement
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: lockfiles
+        # `make locks`, not a re-implementation of it. The Dockerfile installs from
+        # requirements.lock with hashes, not from pyproject.toml, so a dependency change
+        # without a re-export ships one resolution in every container while the whole
+        # suite proves the other — and nothing goes red. scripts/check_locks.sh is the
+        # single definition of that check, run identically here and on a laptop.
+        run: make locks
+
+  # ------------------------------------------------------------- container + CVE scan
+  image:
+    name: image build + CVE scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: build
+        run: docker build --tag raftkv:ci .
+
+      - name: the image does not run as root
+        # OVERVIEW.md's security section claims uid 1000. Claims in a document decay;
+        # a Dockerfile edit that drops `USER raft` would not fail a single test.
+        run: |
+          uid="$(docker run --rm --entrypoint id raftkv:ci -u)"
+          test "$uid" = "1000" || { echo "image runs as uid $uid, expected 1000"; exit 1; }
+
+      - name: trivy
+        # ignore-unfixed is deliberate: a Debian CVE with no released patch is not
+        # something a rebuild can fix, so failing on it trains people to ignore the
+        # gate. Everything fixable at HIGH or above blocks the merge.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: raftkv:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ------------------------------------------------------------------- cluster smoke
   smoke:
+    name: cluster smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - run: docker compose up -d --wait --build
-      - run: ./scripts/smoke.sh
-      - if: always()
-        run: docker compose down --volumes
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: bring up the five-process cluster
+        run: docker compose up -d --wait --wait-timeout 180 --build
+
+      - name: every node serves the dashboard
+        run: |
+          for port in 8001 8002 8003; do
+            curl -fsS --max-time 5 "http://localhost:$port/" \
+              | grep -q '<title>raftkv cluster</title>' \
+              || { echo "node on $port did not serve the dashboard"; exit 1; }
+          done
+
+      - name: election, replication, leader kill, failover, convergence
+        run: ./scripts/smoke.sh
+
+      - name: the PII guarantee, against the running cluster
+        # tests/test_logging_setup.py proves log_event() refuses a value= kwarg, and
+        # tests/test_api.py proves /logs redacts. Both are unit-level. This writes a
+        # canary through the real HTTP surface into the real SQLite state machine and
+        # then reads every node's real log feed looking for it — the check an auditor
+        # would actually run, on the thing that actually ships.
+        run: |
+          canary="pii-canary-$$-do-not-log"
+          leader=""
+          for port in 8001 8002 8003; do
+            role="$(curl -fsS --max-time 5 "http://localhost:$port/state" \
+                    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("role",""))')"
+            if [ "$role" = "leader" ]; then leader="$port"; fi
+          done
+          test -n "$leader" || { echo "no leader after smoke"; exit 1; }
+
+          curl -fsS -X PUT "http://localhost:$leader/kv/pii-probe" \
+            -H 'content-type: application/json' -d "{\"value\": \"$canary\"}" >/dev/null
+          got="$(curl -fsS "http://localhost:$leader/kv/pii-probe" \
+                 | python3 -c 'import json,sys; print(json.load(sys.stdin).get("value",""))')"
+          test "$got" = "$canary" || { echo "the write did not round-trip"; exit 1; }
+
+          for port in 8001 8002 8003; do
+            if curl -fsS --max-time 5 "http://localhost:$port/logs" | grep -qF "$canary"; then
+              echo "PII LEAK: the stored value appears in node $port's /logs feed"
+              exit 1
+            fi
+          done
+          echo "value round-tripped through the cluster and appears in no node's logs"
+
+      - name: capture cluster logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps > compose-logs.txt
+
+      - name: keep them
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compose-logs
+          path: compose-logs.txt
+          retention-days: 7
+
+      - name: tear down
+        if: always()
+        run: docker compose down --volumes --remove-orphans
+
+  # ------------------------------------------------------------------------- CodeQL
+  codeql:
+    name: codeql
+    # Code scanning is free on public repositories and requires GitHub Advanced
+    # Security on private ones. Rather than fail every run on a private repo, this
+    # job declares the condition — and `gate` below knows the difference between a
+    # job that skipped by design and one that was skipped by a path filter.
+    if: github.event.repository.private != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: init
+        # javascript-typescript is not filler: the dashboard is ~1600 lines of
+        # first-party JS inside an HTML file, it renders remote node state, and an
+        # earlier scan found two DOM-XSS paths there (OVERVIEW.md § Security). The
+        # extractor reads inline <script> blocks, so the shipped page is in scope.
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+
+      - name: analyze
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: /language:${{ matrix.language }}
+
+  # -------------------------------------------------------------- dependency review
+  dependency-review:
+    name: dependency review
+    # Pull requests only — it compares the base and head dependency graphs. Same
+    # entitlement caveat as CodeQL, same explicit condition.
+    if: github.event_name == 'pull_request' && github.event.repository.private != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          # This implements consensus directly rather than depending on someone else's,
+          # and a copyleft dependency would impose its own licence terms on the result.
+          deny-licenses: GPL-3.0, AGPL-3.0
+
+  # ----------------------------------------------------------------------- the gate
+  gate:
+    name: gate
+    # The only required status check. `if: always()` is what makes it un-skippable:
+    # without it a failed dependency would cancel this job, and a cancelled required
+    # check reads to branch protection as "not yet reported" rather than "failed".
+    if: always()
+    needs: [static, test, provenance, image, smoke, codeql, dependency-review]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: every gate passed, or skipped for a reason this job knows about
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          results = {k: v["result"] for k, v in json.loads(os.environ["RESULTS"]).items()}
+
+          # Must be green. No condition in this file can skip them, so a skip here means
+          # something changed that this job has not been taught about — which is a
+          # failure, not a pass.
+          REQUIRED = {"static", "test", "provenance", "image", "smoke"}
+          # Allowed to skip, for the one documented reason: the repository is private
+          # and code scanning is a GitHub Advanced Security feature there. They become
+          # required the moment the repo is public.
+          MAY_SKIP = {"codeql", "dependency-review"}
+
+          bad = []
+          for job, result in sorted(results.items()):
+              ok = result == "success" or (job in MAY_SKIP and result == "skipped")
+              print(f"  {'ok  ' if ok else 'FAIL'}  {job}: {result}")
+              if not ok:
+                  bad.append(f"{job} ({result})")
+
+          missing = (REQUIRED | MAY_SKIP) - results.keys()
+          if missing:
+              bad.append(f"not reported at all: {', '.join(sorted(missing))}")
+
+          if bad:
+              print("\ngate FAILED: " + "; ".join(bad))
+              sys.exit(1)
+          print("\ngate PASSED")
+          PY

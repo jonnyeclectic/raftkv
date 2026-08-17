@@ -1,10 +1,24 @@
-.PHONY: install test lint demo down smoke clean-start-check run-local node-up demo-reset
+.PHONY: install test lint gate locks relock demo down smoke clean-start-check run-local node-up demo-reset
 install:
 	uv sync --all-extras
 test:
 	uv run pytest
 lint:
 	uv run ruff check .
+# Every gate ci.yml runs that does not need Docker, in one command. The two that do are
+# `smoke` (per pull request, against compose) and `clean-start-check` (nightly, from a
+# cold build) — CI runs those same scripts, not a re-implementation of them.
+gate: lint locks test
+	@echo "gate PASSED — the docker gates are 'make smoke' and 'make clean-start-check'"
+# Two lockfiles answering to different consumers: uv.lock is what the test suite resolves
+# against, requirements.lock is what the Dockerfile installs from, hash-checked. The
+# script says why that matters and does both directions; CI runs this same target.
+locks:
+	./scripts/check_locks.sh
+# After changing a dependency in pyproject.toml. Both files, always in the same commit.
+relock:
+	uv lock
+	uv export --frozen --no-dev --no-emit-project -o requirements.lock
 demo:
 	docker compose up -d --wait --build
 	@echo "dashboard: http://localhost:8001/"

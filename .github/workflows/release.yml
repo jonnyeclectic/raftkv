@@ -1,0 +1,177 @@
+name: release
+
+# The CD half: turn a tag into a signed, scanned, provenance-carrying container image.
+#
+# Two gates stand between a tag and a published image, and they are different kinds of
+# gate on purpose:
+#
+#   1. `verify` — machine gate. The full suite and a CVE scan run again against the
+#      exact tagged tree. Nothing is published that has not just been proved.
+#   2. `publish` — human gate. It runs in the `ghcr` environment, which is where a
+#      required reviewer is configured (Settings → Environments → ghcr). Approval is
+#      a property of the environment, not of this file, so tightening it later needs
+#      no code change and leaves an audit trail of who approved which release.
+#
+# What ships alongside the image: a CycloneDX SBOM, and a build provenance attestation
+# signed through Sigstore that binds the image digest to this workflow, this commit and
+# this runner. `gh attestation verify oci://... --repo <owner>/<repo>` checks it, which
+# is the difference between "we built this" and "here is proof of what built this".
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.12.1"
+  PYTHON_VERSION: "3.14"
+  NODE_VERSION: "24"
+  REGISTRY: ghcr.io
+
+jobs:
+  verify:
+    name: verify the tagged tree
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: install
+        run: uv sync --all-extras --frozen
+
+      - name: the lockfile the image installs from is current
+        run: |
+          uv lock --check
+          uv export --frozen --no-dev --no-emit-project -o requirements.lock
+          git diff --exit-code -- requirements.lock
+
+      - name: pytest
+        run: uv run pytest -o addopts="" -rs
+
+  publish:
+    name: scan, push, attest
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The human gate. An environment with no reviewers configured is a no-op, so this
+    # is safe to merge today and becomes an approval step the moment someone is added.
+    environment:
+      name: ghcr
+      url: https://github.com/${{ github.repository }}/pkgs/container/raftkv
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # OIDC — the keyless Sigstore signing identity
+      attestations: write # write the provenance attestation back to the repo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: resolve image name and version
+        # GHCR rejects uppercase in a repository path; GitHub owners may contain it.
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          image="$REGISTRY/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          if [ "$REF_TYPE" = "tag" ]; then version="${REF_NAME#v}"; else version="0.0.0-dev"; fi
+          {
+            echo "IMAGE=$image"
+            echo "VERSION=$version"
+          } >> "$GITHUB_ENV"
+
+      - name: build
+        # Built once, locally, so the same bytes are scanned and then pushed. Building
+        # twice would mean scanning an image that is not the one published.
+        run: |
+          docker buildx create --use --name release-builder
+          docker buildx build \
+            --tag "$IMAGE:$VERSION" \
+            --tag "$IMAGE:latest" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --provenance=false \
+            --load .
+
+      - name: trivy — nothing ships with a fixable HIGH
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.VERSION }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.VERSION }}
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - name: keep the SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 90
+
+      - name: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login "$REGISTRY" -u "$ACTOR" --password-stdin
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+          # RepoDigests is only populated once the push has been accepted, so this is
+          # the digest the registry actually holds — not one computed locally and hoped
+          # to match. The attestation below is bound to it.
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$VERSION" | cut -d@ -f2)"
+          case "$digest" in sha256:*) ;; *) echo "no digest after push"; exit 1 ;; esac
+          echo "DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "published $IMAGE@$digest"
+
+      - name: build provenance attestation
+        # Free on public repositories; on private ones it needs GitHub Enterprise Cloud.
+        # Declared as a condition rather than discovered as a red run.
+        if: github.event.repository.private != true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.DIGEST }}
+          push-to-registry: true
+
+      - name: summary
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image | \`$IMAGE:$VERSION\` |"
+            echo "| digest | \`$DIGEST\` |"
+            echo "| verify | \`gh attestation verify oci://$IMAGE:$VERSION --repo $GITHUB_REPOSITORY\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
