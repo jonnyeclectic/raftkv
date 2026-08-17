@@ -59,13 +59,20 @@ class CountingTransport:
     def __init__(self, inner):
         self._inner = inner
         self.sends: dict[str, int] = {}
+        # Rejections separately, because they are the repair walk itself. A send may be a
+        # heartbeat, a batch or a probe; only a rejection means the leader guessed wrong
+        # about where the follower is and has to guess again.
+        self.rejects: dict[str, int] = {}
 
     def __getattr__(self, name):  # register / crash / restore / partition / add_peer
         return getattr(self._inner, name)
 
     async def append_entries(self, peer_id, req):
         self.sends[peer_id] = self.sends.get(peer_id, 0) + 1
-        return await self._inner.append_entries(peer_id, req)
+        resp = await self._inner.append_entries(peer_id, req)
+        if not resp.success:
+            self.rejects[peer_id] = self.rejects.get(peer_id, 0) + 1
+        return resp
 
     async def request_vote(self, peer_id, req):
         return await self._inner.request_vote(peer_id, req)
@@ -110,6 +117,7 @@ async def test_repairing_a_wiped_follower_takes_a_handful_of_round_trips(counted
     reset node came to need most of an hour to rejoin."""
     leader, victim, target = await build_backlog(counted)
     counted.counter.sends[victim] = 0  # count only the repair
+    counted.counter.rejects[victim] = 0
     await counted.nodes[victim].reset()
 
     await eventually(lambda: counted.nodes[victim].last_applied >= target, timeout=20)
@@ -119,6 +127,12 @@ async def test_repairing_a_wiped_follower_takes_a_handful_of_round_trips(counted
     assert trips < GAP / 10, (
         f"{trips} AppendEntries to close a {GAP}-entry gap; a naive one-index walk needs "
         f"~{GAP}, while a hint plus {batches} batches needs a handful"
+    )
+    # And the counter is live rather than stuck at zero — which is what makes the
+    # strict-prefix test below a contrast instead of a tautology.
+    assert counted.counter.rejects.get(victim, 0) > 0, (
+        "a wiped follower must reject at least once: nextIndex points far past the end "
+        "of a log that no longer exists, and finding where it really is IS the walk"
     )
 
 
@@ -170,16 +184,24 @@ async def test_the_repair_survives_the_leader_dying_midway_through_it(counted):
 async def test_a_crashed_and_restarted_follower_needs_no_walk_at_all(counted):
     """The contrast that explains the coverage gap. A node whose log survived is a strict
     PREFIX of the leader's, so `nextIndex` still points at the right place and the first
-    AppendEntries succeeds. One round trip, no repair walk, no optimisation involved —
-    which is why a crash-based catch-up test cannot detect a broken one."""
+    AppendEntries succeeds. No repair walk, no optimisation involved — which is why a
+    crash-based catch-up test cannot detect a broken one.
+
+    Rejections, not sends. The backlog needs `ceil(GAP / MAX_ENTRIES_PER_APPEND)` batches
+    however healthy the follower is, and the leader keeps heartbeating on its timer while
+    they ship — so the send count depends on how long the machine takes to move 1500
+    entries, which is wall clock wearing a round-trip costume, and is exactly the flaky
+    assertion this file's docstring refuses to write. A rejection is the leader saying it
+    guessed wrong about where the follower is. A strict prefix produces none, on any
+    machine, at any speed."""
     leader, victim, target = await build_backlog(counted)
     await counted.crash(victim)
-    counted.counter.sends[victim] = 0
+    counted.counter.rejects[victim] = 0
     rejoined = counted.restart(victim)
     rejoined.transport = counted.counter
 
     await eventually(lambda: rejoined.last_applied >= target, timeout=20)
-    assert counted.counter.sends.get(victim, 0) <= 3, (
-        "a strict-prefix follower should need essentially no repair; if this grew, the "
-        "leader is discarding nextIndex it was entitled to keep"
+    assert counted.counter.rejects.get(victim, 0) == 0, (
+        "a strict-prefix follower should need no repair at all; a single rejection means "
+        "the leader discarded a nextIndex it was entitled to keep"
     )
