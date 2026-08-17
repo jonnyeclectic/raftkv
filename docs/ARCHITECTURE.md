@@ -34,7 +34,9 @@ Owns the single SQLite file per node: Raft persistent state (`current_term`,
 Raft's correctness depends on what is durable when — see the schema section below.
 Interface: `load`/`save_term_and_vote`, log reads (`last_log_index`, `term_at`,
 `entry`, `entries_from`), `append`, `truncate_from`, and `apply` (KV write + advance
-`last_applied` in one transaction).
+`last_applied` in one transaction). `entries_from` takes a `limit` and pushes it into the
+SQL rather than slicing the result: a leader 3000 entries ahead of a follower should not
+decode 3000 rows into pydantic models to send 512 of them, once per round, per peer.
 
 ### `transport.py`
 Owns how RPCs travel. `Transport` is a `Protocol` with `request_vote` /
@@ -51,6 +53,15 @@ Owns the algorithm. `RaftNode` has synchronous rule methods
 election timer, replication/heartbeat loop, single apply loop — plus async flows
 (`_start_election`, `_append_to_peer`, `submit`). It knows nothing about HTTP or
 FastAPI: it talks to a `Transport` and a `Storage`.
+
+`MAX_ENTRIES_PER_APPEND` (512) bounds one `AppendEntries`, and it is half of a pair. The
+batch used to be everything outstanding, to every follower, every round — measured at 2000
+pending: ~195 KiB per peer and ~33 ms of loop time per round across four of them, paid
+again on the next round until the burst drained. But a cap on its own converts catch-up
+into one batch per *heartbeat*, which is the slow repair §5.3 was added to remove. So a
+successful append that leaves the peer still behind sets `_replicate_now` and the next
+round starts at once; only a successful one, or an unreachable peer would spin the loop at
+CPU speed. The number is a payload budget (roughly 50 KiB a message), not a tuning dial.
 
 ### `app.py`
 Owns the HTTP surface: `create_app()` (uvicorn `--factory`) wires config → logging →
@@ -211,19 +222,40 @@ green, still calling itself leader, accepts writes, and commits none of them, be
 commit needs a majority it can no longer reach. On heal it learns the higher term,
 steps down, and its uncommitted suffix is truncated and replaced.
 
-**add node (learner)** attaches a fourth process that is already running but idle
-(`raft-node-4` in compose, port 8004 under `run-local`). It starts with no peers,
-never campaigns and refuses to vote, so the other three do not know it exists until the
-button posts to the leader's `/admin/add-learner`. The dashboard first asks the
-newcomer for its `node_id` and `advertise_addr` — the address *peers* should dial,
-which is not the one the browser used whenever a port mapping is in the way.
+Growing the cluster is **two buttons**, and the split is the design rather than a step
+count. `provision.py` (`POST /admin/spawn-node`) starts an operating-system process and
+takes no part in the log; `/admin/add-learner` appends a configuration entry and is
+leader-only. Membership is a view over the replicated log, so nothing a process does to
+itself can put it in a cluster — only a leader appending can.
 
-The learner then receives the log through the ordinary `nextIndex` walk. It is held in
-`RaftNode.learners`, deliberately **outside** `cfg.peers`, because `quorum` and
-`_advance_commit_index()` read `cfg.peers`: a learner that leaked into that dict would
-be counted toward commit, which is a silent majority-of-four and a data-loss bug. That
-separation is why attaching one needs no joint consensus. Promoting a learner to a
-voting member does need §6 and is not implemented — see [FAILURE_MODES.md](FAILURE_MODES.md).
+**provision node** therefore produces a node that is running and in nobody's
+configuration: a learner with no peers, so an empty voter set, which never campaigns and
+which nothing replicates to. Ordinals start at 4 and walk upward to
+`RAFT_PROVISION_MAX`, so the staged row is empty until someone asks for it. Refused
+inside a container, where the child would share the node's network namespace and
+advertise an address that resolves, for every peer, to that peer's own loopback — compose
+therefore keeps `raft-node-4`/`raft-node-5` pre-declared instead, and Kubernetes grows
+through `kubectl scale`.
+
+**add node (learner)** is the second half: it attaches a process that is already running
+but idle. The dashboard first asks the newcomer for its `node_id` and `advertise_addr` —
+the address *peers* should dial, which is not the one the browser used whenever a port
+mapping is in the way.
+
+The learner then receives the log through the ordinary `nextIndex` walk — the same repair
+a returning follower gets, and a short one even against a long log, because a rejecting
+follower reports where the leader should resume (§5.3) rather than being walked back one
+index per round trip.
+
+It is held in `config.learners`, deliberately **outside** `config.voters`, because that is
+the set `quorum` and `_has_agreement()` count: a learner that leaked into it would be
+counted toward commit, which is a silent majority-of-four and a data-loss bug. That
+separation is why attaching one needs no joint consensus — the voter set does not move.
+
+Promoting a learner to a voting member *does* need §6, and is implemented: `promote_learner()`
+appends C-old,new, from which point agreement requires separate majorities of **both**
+configurations, and `_maybe_leave_joint()` appends C-new once that entry commits. One voter
+at a time. See the membership section below and `tests/test_joint_consensus.py`.
 
 The write control (`key` / `value` / **set on leader**, plus **delete on leader**) takes
 both a click and Enter,

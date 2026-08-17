@@ -24,6 +24,7 @@ from raftkv.models import (
     RequestVoteRequest,
     RequestVoteResponse,
 )
+from raftkv.provision import FIRST_ORDINAL, ProvisionError, spawn
 from raftkv.raft import NotLeaderError, RaftNode
 from raftkv.storage import Storage
 from raftkv.transport import HttpTransport
@@ -42,6 +43,16 @@ class AddLearner(BaseModel):
 
 class Promote(BaseModel):
     node_id: str = Field(min_length=1, max_length=64)
+
+
+class SpawnNode(BaseModel):
+    """The only caller-supplied value that reaches provisioning, and it is an int.
+
+    Bounded here rather than in provision.py so an out-of-range ordinal is a 422 from
+    FastAPI's own validation instead of a handler that has to remember to check. Omitting
+    it -- the dashboard always does -- takes the lowest free slot."""
+
+    ordinal: int | None = Field(default=None, ge=FIRST_ORDINAL, le=99)
 
 
 class Partition(BaseModel):
@@ -241,6 +252,35 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             return {"ok": True, "learner": body.node_id, "addr": body.addr}
 
+        if cfg.provision_enabled:
+
+            @app.post("/admin/spawn-node")
+            async def admin_spawn_node(body: SpawnNode) -> dict:
+                """Start another raftkv process, staged, and return once it answers.
+
+                NOT leader-only, and that is the point rather than an oversight: this
+                starts an operating-system process on this host, which is not a Raft
+                operation and takes no part in the log. The node that comes back is in
+                nobody's configuration -- growing the cluster still needs
+                /admin/add-learner, which IS leader-only. Two endpoints because they are
+                two different things, which is the distinction the whole staged row exists
+                to teach.
+
+                409 rather than 500 on refusal: every reason this declines -- running
+                inside a container, the cap reached, the port taken -- is a statement
+                about the environment that the operator can act on, not a bug.
+                """
+                refuse_if_crashed()
+                try:
+                    result = await spawn(
+                        body.ordinal,
+                        max_nodes=cfg.provision_max_nodes,
+                        log_dir=cfg.log_dir,
+                    )
+                except ProvisionError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                return result
+
         @app.post("/admin/flood")
         async def admin_flood(body: FloodRequest) -> dict:
             """Start a mixed-workload flood on this node. Returns IMMEDIATELY.
@@ -281,6 +321,16 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
     @app.get("/healthz")
     async def healthz() -> dict:
         refuse_if_crashed()  # compose/k8s probes see the failure too
+        # A node with a dead background loop is the worst state a consensus member can be
+        # in, and until this check it was the only one that looked healthy. `_apply_loop`
+        # dies on a single storage error; `_replication_loop` survives, because it only
+        # reads. So the node goes on heartbeating — no follower can elect around a peer
+        # that is still sending AppendEntries — while `last_applied` stops moving and every
+        # client write 504s at `commit_timeout`. Reporting 200 here is what let a probe
+        # keep such a node in service indefinitely.
+        dead = node.degraded
+        if dead:
+            raise HTTPException(status_code=503, detail=f"background task died: {dead}")
         return {"ok": True, "node": cfg.node_id}
 
     @app.get("/build")

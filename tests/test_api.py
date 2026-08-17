@@ -1,3 +1,4 @@
+import sqlite3
 import time
 
 import pytest
@@ -5,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from raftkv.app import create_app
 from raftkv.config import NodeConfig
+from raftkv.models import Role
 
 
 def build_cfg(tmp_path, **overrides):
@@ -63,6 +65,59 @@ def test_put_on_follower_returns_leader_hint(tmp_path):
         assert r.json()["error"] == "not_leader"
 
 
+def test_the_not_leader_response_carries_the_leader_id_field(tmp_path):
+    """The status code alone is not the contract — the hint is (decision D14).
+
+    This build answers a misdirected write with 503 **plus `leader_id`** instead of a
+    redirect, because Docker-internal hostnames are unreachable from the browser. The
+    dashboard reads that field to route the retry, so dropping it turns a one-hop retry
+    into a client that cannot find the leader at all. Found by mutation testing: removing
+    `leader_id` from the payload left the suite green, because the only assertion here
+    was on the status code.
+
+    The value is None while this node has not yet heard from a leader, which is honest
+    and still has to be *present* — a caller distinguishes "not me, try X" from "not me,
+    and I do not know who" by reading the key, not by its absence.
+    """
+    cfg = build_cfg(
+        tmp_path, node_id="f1", peers={"node-2": "nowhere:1"},
+        heartbeat_interval=0.05, election_timeout_min=30.0, election_timeout_max=60.0,
+    )
+    with TestClient(create_app(cfg)) as c:
+        body = c.put("/kv/k", json={"value": "v"}).json()
+        assert "leader_id" in body, "the retry hint is the whole point of answering 503"
+
+
+def test_a_write_that_never_commits_answers_504_not_success(client):
+    """A write that does not commit must not be reported to the client as if it did.
+
+    Driven by making `submit()` time out rather than by starving a real cluster: a node
+    that is leader but cannot reach quorum is not reachable through config alone here
+    (two voters need both, so a node with an undialable peer never wins an election in
+    the first place). The mapping is what the mutation attacks and the mapping is what
+    this pins.
+
+    Mutation testing found the hole: turning the 504 into a 200 left the suite green, so
+    nothing asserted anywhere that an uncommitted write reports failure. That is the
+    difference between "slow" and "silently lost".
+
+    Note what the status does NOT mean: `commit_timeout` says the client gave up, not
+    that the entry was discarded. It may commit afterwards — the at-least-once caveat in
+    FAILURE_MODES.md, and the reason the body names the condition instead of saying the
+    write failed.
+    """
+    wait_for_leader(client)
+
+    async def never_commits(_cmd):
+        raise TimeoutError("commit did not land")
+
+    client.app.state.node.submit = never_commits
+
+    r = client.put("/kv/never-commits", json={"value": "v"})
+    assert r.status_code == 504, f"uncommitted write reported {r.status_code}"
+    assert r.json()["error"] == "commit_timeout"
+
+
 def test_validation_rejects_empty_value(client):
     wait_for_leader(client)
     assert client.put("/kv/k", json={"value": ""}).status_code == 422
@@ -75,6 +130,64 @@ def test_state_endpoint_shape(client):
 
 def test_healthz(client):
     assert client.get("/healthz").json() == {"ok": True, "node": "solo"}
+
+
+def test_healthz_reports_503_once_a_background_loop_has_died(client):
+    """The zombie-leader case, and the reason `degraded` exists.
+
+    `_apply_loop` dies on one storage error — a full disk raises
+    `sqlite3.OperationalError` straight out of `storage.apply()`. `_replication_loop`
+    survives it, because it only reads. So the node keeps heartbeating and keeps its term,
+    which means no follower can ever elect around it, while `last_applied` stops moving and
+    every client write 504s at `commit_timeout`. Forever.
+
+    Before this check the node answered `/healthz` 200 throughout, so a compose healthcheck
+    or a k8s probe would keep it in service and route to it. The failure is silent,
+    permanent, needs no adversary and no partition, and the only trace it left was a single
+    `logger.error` line.
+
+    The applier is killed here the way the disk would kill it — by making the storage call
+    it makes raise — rather than by cancelling the task, because a cancelled task is
+    explicitly NOT degraded (that is how `stop()` shuts a node down) and mocking the flag
+    would test nothing but the mock.
+    """
+    node = client.app.state.node
+    wait_for_leader(client)
+    assert client.get("/healthz").status_code == 200
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    node.storage.apply = boom
+    node.storage.advance_applied = boom
+    node.commit_index = node.storage.last_log_index() + 1
+    node.last_applied = 0
+    node._apply_ready.set()
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and node.degraded is None:
+        time.sleep(0.02)
+
+    assert node.degraded == "solo:_apply_loop", (
+        f"the applier did not die as arranged (degraded={node.degraded!r}); this test "
+        "would otherwise pass without ever reaching the case it exists for"
+    )
+    # Still leader, still heartbeating, still counted for quorum — and now visibly unwell.
+    assert node.role is Role.LEADER
+    response = client.get("/healthz")
+    assert response.status_code == 503
+    assert "_apply_loop" in response.json()["detail"]
+
+
+def test_a_cancelled_task_is_not_degraded(client):
+    """`stop()` cancels every loop, so treating cancellation as failure would make a node
+    report unhealthy on the way down and, worse, make the check meaningless."""
+    node = client.app.state.node
+    for task in node._tasks:
+        task.cancel()
+    time.sleep(0.05)
+    assert node.degraded is None
+    assert client.get("/healthz").status_code == 200
 
 
 def test_dashboard_served(client):

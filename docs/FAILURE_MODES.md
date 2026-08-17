@@ -24,6 +24,9 @@ not (each with what breaks at scale and the production fix).
 | Cluster membership change (§6) | Joint consensus. A learner is promoted to a voting member through a C-old,new entry that requires separate majorities of both configurations, then a C-new entry once that commits. One voter at a time. See [ARCHITECTURE.md](ARCHITECTURE.md) and `tests/test_joint_consensus.py` |
 | Leader no-op on election win (thesis §6.4) | Every new leader appends a no-op from its own term. It flushes entries a previous leader committed but never applied, and committing it is the precondition for any membership change |
 | Catch-up before promotion (thesis §4.2.1) | `promote_learner()` refuses while the learner is behind the committed prefix, and the 409 reports the gap. A learner's lag is free because nobody counts it; the instant it becomes a voter that lag is subtracted from the cluster's fault tolerance |
+| An index on the configuration lookup | `last_config()` sits on the write path — membership is a view over the log, so `_reload_config()` runs after every log mutation — and it was an unindexed scan. At 15,000 entries that is 2.475 ms per append, so 1000 concurrent writes spent ~2.5 s of event-loop time and the leader was voted out for being busy. A partial index over just the configuration entries makes it 0.0021 ms and changes no semantics. See "The throughput ceiling" below and `tests/test_config_lookup.py` |
+| Accelerated log backtracking (§5.3) | On a consistency-check rejection the follower reports where to resume — the first index it is missing, or the term it disagrees on and where its run of that term starts — and the leader jumps instead of stepping. See "Repairing a far-behind follower" below and `tests/test_log_repair.py` |
+| A bound on the `AppendEntries` payload | `MAX_ENTRIES_PER_APPEND = 512`. The batch was every outstanding entry, to every follower, every round: at 2000 pending that is ~195 KiB per peer and ~33 ms of event-loop time per round across four followers, re-read out of SQLite and re-serialised until the burst drained. The cap ships with the rule that pays for it — a successful append that leaves a follower behind re-fires replication immediately, so catch-up costs `ceil(behind / 512)` *rounds* and not that many heartbeats. `tests/test_append_batching.py` fails if either half is removed |
 
 ## Table 1c — bugs an adversarial review found, and what fixed them
 
@@ -37,6 +40,7 @@ generator and reading its own output sceptically. Each row is now a regression t
 | `reset()` reverted membership to the **startup** voter set | After growth to five, node-1/2/3 boot naming only each other, so a reset left them a 3-voter configuration with quorum 2. Two resets on the minority side of a partition elected a second leader, committed a write, **acknowledged it to the client**, and lost it on repair. A 2-of-5 partition is the exact failure five voters exist to survive | Membership is re-seeded as a term-0 log entry, so it survives the wipe but loses to any real leader's index 1. `membership=bootstrap` opts into the revert and is only sound applied to every node at once. `tests/test_reset.py::test_reset_cannot_shrink_a_grown_cluster_into_a_second_quorum` |
 | A promoted-then-reset voter demoted itself to a learner | Same root cause: it silently withheld votes while still being counted, deadlocking elections | Same fix; `is_voter` was already derived from the log rather than the startup flag |
 | An undialable peer raised `KeyError`, not `TransportError` | It escaped every `except TransportError` and **killed the election timer permanently**. The node sat as a follower forever, campaigning never again, with nothing logged | Both transports raise `TransportError` for an unknown or address-less peer. `RAFT_ADVERTISE` is now set on bootstrap nodes too, since an empty one is what put an undialable voter in the configuration. `tests/test_membership_growth.py::test_an_undialable_voter_does_not_kill_the_election_loop` |
+| A node whose background loop died stayed leader and kept reporting healthy | `_apply_loop` dies on any storage error — a full disk is one `sqlite3.OperationalError` out of `storage.apply()` — while `_replication_loop` survives, because it only *reads*. So the node kept heartbeating, which means no follower could elect around it, with `commit_index` advancing past a `last_applied` that would never move again and every client write 504ing at `commit_timeout`. Permanently. Nothing recovered from it unaided: the cluster cannot depose a peer that is still sending AppendEntries, `/healthz` answered 200 so k8s never restarted the pod and the Service kept routing to it, and the only trace was a single `logger.error` that had already scrolled past. No adversary, no partition, no scale — one disk hiccup. Found by two independent audits of this repo, which is itself the point: it is invisible from inside the algorithm, because the algorithm is behaving correctly | `RaftNode.degraded` names the dead loop and `/healthz` answers 503 while it is set, so the node fails its probe instead of silently wedging the cluster. `k8s/raftkv.yaml` gains a `livenessProbe` — readiness alone only removes it from the Service, and this state needs a *restart* — set deliberately slacker than readiness, because taking a node out of rotation is cheap and killing it costs an election. Cancellation is explicitly not degraded, since `stop()` cancels every loop. `tests/test_api.py::test_healthz_reports_503_once_a_background_loop_has_died` |
 | `/admin/flood` raised `NameError` on every call | `FloodRunner` was imported but never constructed. The feature had no test, so nothing said so | Constructed in `create_app()` and cancelled on shutdown. `tests/test_flood_endpoint.py` |
 | One failed write abandoned the whole flood, and the panel called it green | The generator's per-write `try` caught only `NotLeaderError` and `TimeoutError`, and `asyncio.gather` propagates the first exception while abandoning every task queued behind it. So one unexpected error — a SQLite `database is locked` under contention being the realistic one — stranded `done` below `total` permanently. Worse, the dashboard tinted by `timeout \|\| not_leader`, both of which were zero, so a burst that never ran rendered as a clean green sweep. A load generator that silently under-reports load is worse than no load generator | Every write settles into a counter and the worker raises nothing but `CancelledError`; unexpected errors land in a new `failed` count with `last_error`, `gather` takes `return_exceptions=True` as a second line of defence, and the panel tints `failed` **red** (not the amber that means "Raft under strain") and calls a short burst `INCOMPLETE`. `tests/test_flood_endpoint.py`, `tests/test_dashboard_flood.py` |
 
@@ -89,65 +93,158 @@ dissertation.
 | PreVote (thesis §9.6) | A node rejoining from a partition carries an inflated term and forces one needless election, disrupting a healthy leader — our partition demo shows exactly this disruption | PreVote round: ask "would you vote for me?" without incrementing the term; only real candidates disturb the cluster |
 | Linearizable reads (§8) | Follower reads can be stale; even leader reads can be stale across a partition (a deposed leader serving reads it thinks it still owns) | ReadIndex protocol or leader leases; or route reads through the log |
 | Client sessions for exactly-once (§8) | A client that retries a timed-out write can apply it twice (at-least-once today; `request_id` only detects a log index reused by a different leader, not cross-index duplicates) | Client sessions with per-client serial numbers; the state machine deduplicates before applying |
-| Accelerated nextIndex backoff (Students' Guide) | Catch-up of a far-behind follower takes one RPC round-trip per missing entry — minutes on long logs | Follower returns conflictIndex/conflictTerm; leader jumps `nextIndex` whole terms at a time |
 | TLS/mTLS between nodes | RPCs cross the network in plaintext: any on-path attacker can read or forge votes and entries; medical-grade deployments would require encryption in transit | mTLS between peers (SPIFFE/cert-manager identities), TLS on the client API |
-| Batching and flow control on the write path | A large burst of concurrent writes degrades super-linearly and can starve the heartbeat — measured below | Batch client commands into one append and one fsync; cap in-flight AppendEntries per follower; apply backpressure at the API rather than accepting unbounded concurrent submits |
+| Flow control on the write path | Past ~1000 concurrent client writes the leader loses its term and the whole burst reports `commit_timeout` — measured below. The same volume sent in smaller batches is fine, so it is concurrency the server has no way to refuse. The one piece of this that *is* implemented is the outbound half: the `AppendEntries` payload is capped (table 1b). Nothing caps what comes *in* | Batch client commands into one append and one fsync, so N concurrent writes cost one durable write rather than N; apply backpressure at the API — a bounded submit queue, or a 429 — rather than accepting unbounded concurrent submits and discovering the limit as a lost election |
+
+## Repairing a far-behind follower, measured
+
+A follower whose log has diverged — or been wiped by `/admin/reset` — is repaired by the
+leader walking `nextIndex` back until the consistency check passes, then shipping the rest.
+The paper allows the naive walk (one index per rejection) and the Students' Guide calls it
+correct but slow "on long logs". This repo shipped the naive walk on the reasoning that a
+short-lived cluster never builds a long log.
+
+`/admin/flood` builds one in six seconds. Measured live on 2026-08-16, on the running
+five-node cluster: a 3000-write mixed flood left the log at **6224 entries**; resetting
+node-2 from the dashboard then produced this:
+
+| | Naive walk (what shipped) | With the §5.3 hint |
+|---|---|---|
+| Rejections reaching one follower | ~2 per second (heartbeat-paced) | same |
+| Round trips to repair 6224 entries | 6224 | 2 |
+| Wall clock | **~52 minutes** | under a second |
+| What the operator sees meanwhile | an empty state machine, indefinitely | it fills |
+
+The failure is safe — the node holds a single term-0 configuration entry and commits
+nothing — but *safe* and *broken* look identical on a dashboard, and 52 minutes is longer
+than anyone will wait. That is what moved this from an acknowledged optimization to a fix.
+
+The hint itself is two optional integers on `AppendEntriesResponse`, and it is advice
+rather than authority: every jump still lands on an ordinary consistency check, and the
+leader clamps the result so it can never rise or stand still. A wrong hint therefore costs
+one round trip; it cannot corrupt a log, and it cannot hang the repair. A peer that sends
+no hint at all — older code, or the stale-term rejection, which carries none — falls back
+to the one-index walk, so the optimization never became a requirement.
 
 ## The throughput ceiling, measured
 
-`/admin/flood` exists to make this reproducible rather than theoretical. Driven from the
-dashboard against the real three-node cluster over HTTP, on an otherwise idle machine:
+`/admin/flood` exists to make this reproducible rather than theoretical — and it earned
+its keep: driving it and reading the output sceptically is what found the bug below.
 
-| Writes, all at once | Wall clock | Outcome |
+There **was** a ceiling. Past ~1000 concurrent writes the leader lost its term and the
+whole burst reported `commit_timeout`. Measured 2026-08-16 on a five-voter cluster over
+HTTP, rediscovering the leader before every run:
+
+| Writes all at once | Before | After |
 |---|---|---|
-| 200 | 0.1 s | all committed, 2381/s |
-| 500 | 0.5 s | all committed, 1111/s |
-| 1000 | 1.7 s | all committed, 572/s |
-| 2000 | 10.9 s | **all 2000 commit-timeout**, one election, 0/s |
+| 200 | 0.5 s, all committed | 0.1 s, all committed |
+| 700 | 1.4 s, all committed | 0.2 s, all committed |
+| 1000 | **7.1 s, all timed out, leadership lost** | 0.2 s, all committed |
+| 1500 | **8.8 s, all timed out, leadership lost** | 0.4 s, all committed |
+| 2000 | **10.2 s, all timed out, leadership lost** | 0.5 s, all committed |
 
-Throughput *falls* as the burst grows — 2381/s at 200, 572/s at 1000 — which is the
-super-linear cost showing up before the cliff does. Between 1000 and 2000 it goes over.
+The term did not move once across the whole "after" column — no elections at all. The
+largest burst the endpoint permits, 5000 writes with 2000 in flight, now finishes in
+**2.0 s at 2524 writes/second** with every write committed.
 
-Quote these numbers, not the ones an earlier revision of this file carried. Those were
-measured in-process over `MemoryTransport` while two other jobs saturated the CPU, and
-they put the cliff at 500 — five times pessimistic. The mechanism was right; the numbers
-described the machine, not the system.
+### The bug was a missing index
 
-The mechanism is not the network and not fsync — it is `_advance_commit_index()`. It scans
-the log downward from `last_log_index` to `commit_index`, one SQLite `term_at()` query per
-index, and it runs once per `submit()`. While a burst is uncommitted that scan is
-O(pending), so a burst of N costs O(N²) queries: instrumented, 200 concurrent writes issue
-**20,315** `term_at()` calls against 203 appends. Those queries are synchronous, on the
-same event loop that owes every follower a heartbeat, so past some burst size the
-heartbeat is late, the followers elect around a leader that is merely busy, and every
-in-flight write fails at once.
+The visible mechanism was never in doubt: the leader goes quiet, followers elect around a
+node that is merely busy, and every in-flight write dies at once. Measuring a follower's
+`append_entries_received` during a 1000-write burst caught it directly — **1733 ms with
+nothing arriving**, against an election timeout whose floor is 1500 ms.
 
-Two things follow that are worth saying out loud. The cliff is **load-dependent, not a
-fixed number**: 500 concurrent writes commit cleanly in 0.5 s on an idle machine and time
-out entirely when the CPU is contended — same code, same cluster. That is why
-`tests/test_flood.py` asserts invariants and never latency or a success count, and it is
-why the table above names the conditions it was measured under.
-
-And the failure is **safe**. Measured immediately after the 2000-write burst timed out
-every single client:
+What blocked the loop was `last_config()`. Membership is a *view over the log* rather than
+a cache beside it, so `_reload_config()` runs after every log mutation and `last_config()`
+runs with it — putting that query on the write path, once per `submit()`. It was an
+unindexed scan:
 
 ```
-node-1 follower  term 2  log 2702  commit 2702  applied 2702  1000 keys
-node-2 follower  term 2  log 2702  commit 2702  applied 2702  1000 keys
-node-3 LEADER    term 2  log 2702  commit 2702  applied 2702  1000 keys   -> all agree
+log  1,000 entries -> 0.175 ms   x1000 concurrent = 0.17 s
+log  5,000 entries -> 0.823 ms   x1000 concurrent = 0.82 s
+log 15,000 entries -> 2.475 ms   x1000 concurrent = 2.48 s   <- past the election floor
 ```
 
-Nothing lost, nothing misordered, no node left behind: the writes were *refused*. The term
-moved 1 → 2 because the starved heartbeat did cost the leader its leadership, which is the
-mechanism above showing up as an election rather than as corruption. A surviving value for
-a contended key is still the one the log ordered last. Degradation under overload is a
-liveness problem here, not a safety one — and that distinction is the whole point of
+2.48 s predicted, 1733 ms measured. The cost is O(log length x concurrency), which is why
+the cliff appeared to *move* between measurement sessions: the log grew from 3,000 to
+nearly 16,000 entries over an afternoon of testing and the ceiling fell underneath it.
+
+The fix is a partial index over just the configuration entries (`storage.py`, `_SCHEMA`).
+On the live 15,923-entry log: **2.475 ms → 0.0021 ms**, and the query plan changes from
+`SCAN log` to `SCAN log USING INDEX log_config`. No semantics move — the configuration is
+still derived from the log, so truncating a config entry still reverts to the previous one
+for free. Leader silence under the maximum burst is now **494 ms**, which is just the
+heartbeat interval. `tests/test_config_lookup.py`.
+
+### Two wrong answers came first, and they were worth having
+
+Before the index, two other costs were found, fixed, and **did not move the cliff**:
+
+- `_advance_commit_index()` walked every index from the log end down to `commit_index`,
+  one query each, once per `submit()` — 4901 `term_at()` calls to cross one 4900-entry
+  gap. Now flat (`tests/test_commit_scan.py`).
+- The `AppendEntries` batch was unbounded: ~195 KiB per peer and ~33 ms of loop time per
+  round at 2000 pending. Now capped at 512 (`tests/test_append_batching.py`).
+
+Both are real improvements and neither was the answer. What they bought was the elimination
+of the replication path as a suspect, which is what forced the question "where does the
+loop actually go" — and instrumenting *that* rather than optimising the next plausible
+thing is what found the index in one measurement. An earlier revision of this file asserted
+the O(N²) commit scan **was** the cause. It was not, and profiling said so plainly: during
+a burst the event loop sat idle in `kqueue` rather than executing Raft code.
+
+### A measurement pitfall worth writing down
+
+The first numbers taken for this section were wrong, in a way worth repeating because it
+looks like a result. The harness resolved the leader **once** and then posted every run to
+that address. The first big burst costs the leader its leadership, so runs two and three
+went to a follower and read *its* flood counters — which never ran — producing an
+identical `ok=0 timeout=999 not_leader=1001` for every subsequent row. A stable-looking
+number repeated across runs is exactly what a real ceiling would look like.
+
+Rediscover the leader before every run. `not_leader` climbing is the tell that you did not.
+
+### The ceiling has not been removed, only moved
+
+Nothing here makes the write path unbounded. The endpoint caps a burst at 5000 writes and
+2000 in flight, and those are the largest numbers anyone has run against it — the cluster
+absorbs them, so where it breaks next is *unmeasured*, not *nonexistent*. The remaining
+omission in the table above stands: there is still no batching of client commands into one
+append and one fsync, and still no backpressure at the API. A slower disk, a contended CPU,
+or a burst past what `/admin/flood` will issue can all still starve a heartbeat.
+
+That is also why `tests/test_flood.py` asserts invariants — convergence, `last_applied <=
+commit_index <= last_log_index`, acked writes surviving — and never latency or a success
+count. The same burst that commits in 0.5 s on an idle machine can time out entirely when
+the CPU is contended, same code, same cluster.
+
+### When it did break, it broke safely
+
+Worth keeping, because it is the property that mattered while the ceiling existed and the
+one that will matter again past whatever the next limit is. Measured on the pre-index
+build, immediately after a 2000-at-once burst timed out every single client and cost the
+leader its term:
+
+```
+node-2  log 15017  commit 15017  applied 15017
+node-3  log 15017  commit 15017  applied 15017
+node-4  log 15017  commit 15017  applied 15017   -> all agree
+node-5  log 15017  commit 15017  applied 15017
+```
+
+Nothing lost, nothing misordered, no node left behind: the writes were *refused*, and the
+election that took the leader down is the overload showing up as a leadership change
+rather than as corruption. A surviving value for a contended key is still the one the log
+ordered last — verified separately with the `overwrite` workload, where 1000 concurrent
+writes to a single key left all five nodes agreeing on `v999`. Degradation under overload
+is a liveness problem here, not a safety one, and that distinction is the whole point of
 having the flood.
 
 One nuance the counters hide: a client `timeout` does **not** mean the entry never
-committed. Those 2000 writes were appended and the survivors committed after the client
-had already given up at `commit_timeout`. That is the at-least-once story in the omissions
-table above, seen live rather than argued.
+committed. Every one of those 2000 writes reported `commit_timeout` to its client, and the
+log still ended at 15017 with all four nodes applied to it — they were appended and
+committed after the clients had already given up at `commit_timeout`. That is the
+at-least-once story in the omissions table above, seen live rather than argued.
 
 ## When a learner can safely be promoted
 

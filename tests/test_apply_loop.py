@@ -70,6 +70,40 @@ async def test_advances_past_entries_with_no_state_machine_effect(make_node):
     assert node.storage.kv_all() == {"a": "v", "b": "v"}
 
 
+async def test_a_trailing_no_op_advances_last_applied_durably(make_node):
+    """The same rule at the position where breaking it is invisible, and the DURABLE
+    value rather than the in-memory one.
+
+    Two things conspire to hide this. The test above ends on a command, so
+    `storage.apply()` writes `last_applied` on its way past and repairs whatever the
+    non-command branch failed to write. And in-memory `self.last_applied` advances
+    unconditionally, so the loop looks like it worked. Only the database disagrees.
+
+    A trailing no-op removes the repair, and it is the ordinary shape rather than a
+    contrived one: every leader appends a no-op on election and it stays the tail until a
+    client writes. If `advance_applied()` did not reach the database, a restart resumes
+    from the last real command and replays everything after it — invisible in the data
+    here only because set and delete happen to be idempotent.
+
+    Found by mutation testing (`scripts/mutate.py`, "apply loop: stall on non-command
+    entries"): replacing that call with `pass` left the whole suite green.
+    """
+    node = make_node()
+    node.current_term = 1
+    node.storage.append([entry(1, "a"), LogEntry(term=1, command=NoOp())])
+    node.commit_index = 2
+
+    async with applier(node):
+        node._apply_ready.set()
+        await eventually(lambda: node.last_applied == 2)
+
+    assert node.storage.load()[2] == 2, (
+        "in-memory last_applied moved but the database did not; a restart here would "
+        "replay every entry after the last real command"
+    )
+    assert node.storage.kv_all() == {"a": "v"}
+
+
 async def test_applies_nothing_while_nothing_is_committed(make_node):
     node = make_node()
     node.storage.append([entry(1, "a")])

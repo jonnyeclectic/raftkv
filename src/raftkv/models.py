@@ -5,6 +5,24 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+# Most entries in one AppendEntries — the leader's send cap AND the wire cap, deliberately
+# one number (see AppendEntriesRequest.entries). The batch used to be unbounded — every
+# outstanding entry, to every follower, every round — so a burst of N in flight shipped an
+# O(N) payload per peer per round and paid to decode it out of SQLite each time. Measured
+# at 2000 pending: ~195 KiB per peer and ~33 ms of event-loop time per round across four
+# followers, work that repeats until the burst drains.
+#
+# The number is a payload budget, not a tuning dial: at roughly 100 bytes an entry this
+# caps one message near 50 KiB. Raising it walks back toward the unbounded behaviour;
+# lowering it costs more round trips, which is cheap ONLY because a successful append that
+# leaves a follower behind re-fires replication immediately instead of waiting for the next
+# heartbeat (see raft._append_to_peer). Change one without the other and catch-up after a
+# flood goes back to taking minutes.
+#
+# It lives here rather than in raft.py because the receiving side needs it too, and a
+# second constant that merely happens to match is the drift this avoids.
+MAX_ENTRIES_PER_APPEND = 512
+
 
 class Role(StrEnum):
     FOLLOWER = "follower"
@@ -93,7 +111,20 @@ class AppendEntriesRequest(BaseModel):
     leader_id: str
     prev_log_index: int
     prev_log_term: int
-    entries: list[LogEntry] = Field(default_factory=list)
+    # Bounded because `/raft/append-entries` is UNAUTHENTICATED. Every entry was already
+    # bounded (`Command.key` 256, `Command.value` 4096) and the list was not, so the size
+    # of one request was capped only by how many entries a caller cared to put in it —
+    # 50,000 of them decode to ~205 MB, from anyone who can open a socket to the port.
+    # The asymmetry was the tell: every *admin* model here is bounded, and the two models
+    # reachable without credentials were the ones that were not.
+    #
+    # Sharing the leader's send cap rather than declaring a second number is the point: two
+    # constants that must agree are a drift waiting to happen, and raising the send cap
+    # while leaving a smaller wire cap in place would make every follower reject a
+    # well-formed append.
+    entries: list[LogEntry] = Field(
+        default_factory=list, max_length=MAX_ENTRIES_PER_APPEND
+    )
     leader_commit: int
 
 

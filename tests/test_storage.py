@@ -53,6 +53,40 @@ def test_apply_is_atomic_with_last_applied(store):
     assert store.load()[2] == 1  # last_applied advanced in the same transaction
 
 
+def test_advance_applied_is_durable_too(store):
+    """The other half of exactly-once, and the half nothing was checking.
+
+    A `NoOp` or `ClusterConfig` entry has no state-machine effect, so it goes through
+    `advance_applied()` rather than `apply()`. That still has to reach the DATABASE: the
+    node reloads `last_applied` from here on restart, and a durable value that lags means
+    it replays entries it already applied. The KV state machine happens to be idempotent
+    for set and delete, so the replay is invisible in the data — which is exactly why this
+    needed an assertion rather than a scenario. Mutation testing found it: replacing the
+    `advance_applied()` call in the apply loop with `pass` left the entire suite green.
+    """
+    store.append([entry(1, key="a", value="1", rid="r1")])
+    store.apply(1, store.entry(1).command)
+    store.advance_applied(2)  # e.g. a no-op or configuration entry at index 2
+
+    assert store.load()[2] == 2, "last_applied did not reach the database"
+    assert store.kv_all() == {"a": "1"}, "advance_applied must not touch the state machine"
+
+
+def test_last_applied_survives_reopening_the_file(store, tmp_path):
+    """Durability is only meaningful across a process boundary, so cross one."""
+    store.append([entry(1, key="a", value="1", rid="r1")])
+    store.apply(1, store.entry(1).command)
+    store.advance_applied(2)
+    path = store._conn.execute("PRAGMA database_list").fetchone()[2]
+    store.close()
+
+    reopened = Storage(path)
+    try:
+        assert reopened.load()[2] == 2, "a restarted node would replay applied entries"
+    finally:
+        reopened.close()
+
+
 def test_apply_set_then_delete(store):
     store.apply(1, Command(op="set", key="k", value="v", request_id="a"))
     store.apply(2, Command(op="delete", key="k", request_id="b"))

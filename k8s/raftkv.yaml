@@ -84,6 +84,20 @@ spec:
             # and recycling healthy pods. 3s tolerates the spike; a node that is
             # genuinely wedged still fails 3 consecutive probes and is replaced.
             timeoutSeconds: 3
+          # Readiness alone cannot fix the state it now detects. A node whose apply loop
+          # has died needs RESTARTING, not just removing from the Service: it keeps
+          # heartbeating, so no follower can elect around it, and the cluster stays wedged
+          # behind a member that is present and useless. Without a livenessProbe nothing
+          # ever restarts that pod.
+          #
+          # Deliberately slacker than readiness. Taking a node out of rotation is cheap and
+          # reversible; killing it costs an election, so it should take sustained failure —
+          # 3 x 10s here versus 3 x 5s above.
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: logs, mountPath: /var/log/raftkv }   # writable under readOnlyRootFilesystem

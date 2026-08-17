@@ -36,10 +36,6 @@ addopts = "-q"
 line-length = 100
 target-version = "py314"
 src = ["src", "tests"]
-# reddit_query.py predates this project and stays untracked (see .gitignore);
-# .reconstruct/ is the staged-history scaffolding and its own repo. Both are
-# excluded explicitly because ruff only honors .gitignore inside a git repo.
-extend-exclude = ["reddit_query.py", ".reconstruct"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

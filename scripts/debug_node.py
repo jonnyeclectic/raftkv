@@ -26,10 +26,19 @@ required even on a bootstrap node: a node writes its OWN address into the
 configuration entry, that entry replicates, and an empty one leaves a later-joined
 member holding a voter it can never dial.
 
-Start the other two nodes first with `make run-local`, then debug this. Slow the
-cluster down so a breakpoint does not instantly cost you the leadership you were
-about to inspect: RAFT_HEARTBEAT=5 RAFT_ELECTION_MIN=60 RAFT_ELECTION_MAX=120.
+Start the other two nodes first with `make run-local`, then debug this. Run node-1 at
+DEFAULT timings: run_local.sh gives nodes 2/3 stretched 4-6 s election timeouts, which
+is what makes this node win every election it contests and gives a breakpoint ~4 s of
+grace before the peers elect around it (holding one past that is a deliberate way to
+exercise the failover path). Do not slow THIS node down instead -- stretching node-1's
+own timers is backwards: its timer then never fires first, so it cannot win an election,
+and a heartbeat slower than the peers' election timeout costs it any leadership it is
+handed.
 
+Breakpoints: the rule methods in src/raftkv/raft.py are the ones worth stopping in --
+`handle_request_vote`, `handle_append_entries` and `_advance_commit_index`. They are
+synchronous by design, so pausing in one parks the whole event loop, which is exactly
+the "leader stopped heartbeating" condition the peers are meant to detect.
 """
 
 import os

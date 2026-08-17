@@ -84,6 +84,33 @@ def test_an_empty_voter_set_is_satisfied_not_impossible(tmp_path):
     node.storage.close()
 
 
+def test_belonging_to_no_configuration_is_not_agreement(tmp_path):
+    """The complement of the test above, and the guard that keeps it safe.
+
+    `_is_majority({}, ...)` is vacuously TRUE on purpose — that is what lets the joint and
+    non-joint cases share one expression, since a non-joint node has an empty
+    `old_voters`. But run that shortcut on BOTH halves and a node whose own voter set is
+    empty agrees with itself about everything: it would count its own vote as a majority
+    and commit alone. An empty voter set is exactly what a staged node has, and what
+    `reset(membership=bootstrap)` can leave behind on a learner.
+
+    `_has_agreement` therefore short-circuits to False first. Nothing else in the suite
+    reaches this branch — a node with no voters is not `is_voter`, so it never campaigns
+    and never leads — which is precisely why it needs pinning: found by mutation testing,
+    where flipping this `return False` to `return True` left the whole suite green.
+    """
+    node = leader_with(tmp_path)
+    node.config = ClusterConfig(voters={}, old_voters={})
+
+    assert not node._has_agreement(set())
+    assert not node._has_agreement({"node-1"})
+    assert not node._has_agreement({"node-1", "node-2", "node-3"}), (
+        "a node in nobody's configuration must never conclude it has agreement, however "
+        "many acknowledgements it collects"
+    )
+    node.storage.close()
+
+
 # ---------------------------------------------------------------- the transition
 
 def test_promotion_appends_a_joint_entry_that_takes_effect_immediately(tmp_path):

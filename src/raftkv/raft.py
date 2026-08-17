@@ -15,6 +15,7 @@ import time
 from raftkv.config import NodeConfig
 from raftkv.logging_setup import log_event
 from raftkv.models import (
+    MAX_ENTRIES_PER_APPEND,
     AppendEntriesRequest,
     AppendEntriesResponse,
     ClusterConfig,
@@ -32,19 +33,11 @@ from raftkv.transport import Transport, TransportError
 
 logger = logging.getLogger("raftkv.raft")
 
-# Most entries in one AppendEntries. The batch used to be unbounded — every outstanding
-# entry, to every follower, every round — so a burst of N in flight shipped an O(N)
-# payload per peer per round and paid to decode it out of SQLite each time. Measured at
-# 2000 pending: ~195 KiB per peer and ~33 ms of event-loop time per round across four
-# followers, work that repeats until the burst drains.
-#
-# The number is a payload budget, not a tuning dial: at roughly 100 bytes an entry this
-# caps one message near 50 KiB. Raising it walks back toward the unbounded behaviour;
-# lowering it costs more round trips, which is cheap ONLY because a successful append
-# that leaves a follower behind re-fires replication immediately instead of waiting for
-# the next heartbeat (see _append_to_peer). Change one without the other and catch-up
-# after a flood goes back to taking minutes.
-MAX_ENTRIES_PER_APPEND = 512
+# MAX_ENTRIES_PER_APPEND is imported above rather than defined here: it is now BOTH the
+# leader's send cap and the bound on `AppendEntriesRequest.entries`, so it has to live
+# where the wire shape does. models.py carries the full rationale, including why lowering
+# it is cheap only in company with the re-fire in _append_to_peer. The import re-exports
+# it, so `from raftkv.raft import MAX_ENTRIES_PER_APPEND` still resolves.
 
 
 class NotLeaderError(Exception):
@@ -691,6 +684,26 @@ class RaftNode:
         for task in self._tasks:
             # a silently-dead loop degrades the node with zero signal — make it loud
             task.add_done_callback(self._on_task_death)
+
+    @property
+    def degraded(self) -> str | None:
+        """The name of a background loop that died, or None. Read by `/healthz`.
+
+        A log line is not a signal. If `_apply_loop` dies — one `sqlite3.OperationalError`
+        from a full disk is enough — `_replication_loop` survives, because it only reads.
+        So the node keeps heartbeating, keeps its term, and keeps every follower from
+        electing around it, while `commit_index` advances past a `last_applied` that will
+        never move again. Every client write then 504s at `commit_timeout`, forever.
+
+        Nothing recovers from that on its own. The cluster cannot elect around a node that
+        is still heartbeating, and Kubernetes will not restart a pod that still answers its
+        probe. The only evidence was one `logger.error` that has already scrolled past.
+        A dead loop must therefore be visible on the health surface, not just in the logs.
+        """
+        for task in self._tasks:
+            if task.done() and not task.cancelled() and task.exception() is not None:
+                return task.get_name()
+        return None
 
     def _on_task_death(self, task: asyncio.Task) -> None:
         if task.cancelled() or task.exception() is None:

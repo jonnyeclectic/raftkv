@@ -49,9 +49,11 @@ console.log(JSON.stringify(probeList(new URLSearchParams({json.dumps(query)}))))
     return json.loads(out.stdout)
 
 
-def test_default_is_the_two_nodes_that_are_always_running():
-    """run_local.sh and docker-compose both start node-4 and node-5 idle. Probing them
-    by default is what puts the staged row on screen with no query string at all."""
+def test_default_is_the_first_two_provisionable_slots():
+    """8004 and 8005 are where the first two `provision node` presses land, and they are
+    also the two idle nodes docker-compose still ships pre-declared (a container cannot
+    spawn its own siblings). Probing them by default is what makes a provisioned node-4
+    appear in the staged row with no query string and no PROBE mutation at all."""
     assert run("") == IDLE
 
 

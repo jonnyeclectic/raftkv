@@ -32,18 +32,23 @@ run-local:
 	./scripts/run_local.sh
 # Provision one more PROCESS while the cluster runs — the run-local answer to
 # `kubectl scale`. It comes up staged (learner, no peers, empty voter set); attaching
-# and promoting it from the dashboard is what makes it a member. N defaults to 6
-# because run_local.sh already starts 4 and 5.
+# and promoting it from the dashboard is what makes it a member. N defaults to 4: nothing
+# above node-3 starts by itself any more, so 4 is the first free slot.
+#
+# The dashboard's `provision node` button does exactly this over HTTP
+# (POST /admin/spawn-node); this target is the same operation from a terminal, for when
+# you want the mechanism visible rather than behind a button.
 node-up:
-	@./scripts/node_up.sh $(or $(N),6)
+	@./scripts/node_up.sh $(or $(N),4)
 # DESTRUCTIVE, and the fastest way back to a known-good starting state: stops every local
 # node and deletes every database and log. `data/` and `logs/` are gitignored build
 # products, so nothing here is recoverable and nothing here needs to be. Use it between
 # runs — a half-grown 5-voter cluster left behind by the last one is state the next one
 # silently inherits.
 demo-reset:
-	-@pkill -f 'raftkv.app' 2>/dev/null || true
-	-@pkill -f 'create_app --port' 2>/dev/null || true
+	-@pkill -f '[r]aftkv.app' 2>/dev/null || true
+	-@pkill -f '[c]reate_app --port' 2>/dev/null || true
+	-@pkill -f '[d]ebug_node.py' 2>/dev/null || true
 	rm -rf data logs
 	@echo "clean. now: make run-local, then start node-1 in the IDE debugger"
 

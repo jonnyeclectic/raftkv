@@ -2,8 +2,8 @@
 
 The rule is one line — adding a test file means also adding its row to the test matrix in
 README.md — and until now the only thing enforcing it was whoever remembered. That is the
-same class of guarantee as "run the clean-start check the night before the demo": correct,
-written down, and dependent on a human under time pressure.
+same class of guarantee as "remember to run the clean-start check": correct, written
+down, and dependent on a human under time pressure.
 
 The failure it prevents is quiet and asymmetric. A missing row costs a reviewer nothing
 they will notice; a *stale* row is worse, because it describes coverage that no longer
@@ -20,11 +20,11 @@ that exists but is linked from nowhere is a document nobody opens.
 
 And then the citations that name a *specific test*, anywhere in the prose. Those are the
 ones that rot silently, because the two checks above cannot see them: they only read
-README rows, and only at file granularity. Reorganising the suite into topic files deleted
-a test file that `docs/OVERVIEW.md` cited by name; the citation had to be taken out by
-hand, and nothing here would have failed if it had not been, because a `.md` is not
-imported by anything. A citation is the only claim in this repo that nothing executes,
-which is exactly why it needs a test rather than a habit.
+README rows, and only at file granularity. Reorganising the suite into topic files
+deleted a file that `docs/OVERVIEW.md` cited by name; the citation had to come out by
+hand, and nothing here would have failed if it had not, because a `.md` is not imported
+by anything. A citation is the only claim in this repo that nothing executes, which is
+exactly why it needs a test rather than a habit.
 """
 
 import pathlib
@@ -43,8 +43,8 @@ DOC_CITATION = re.compile(r"\(docs/([A-Za-z0-9_]+\.md)\)")
 ANY_CITATION = re.compile(r"tests/(test_[a-z0-9_]+\.py)(?:::([A-Za-z0-9_]+))?")
 
 # Every markdown file a reader is handed, which is exactly the set that can make a claim
-# about a test. The glob is non-recursive because `docs/` is flat by design.
-PROSE = [README, *sorted((REPO / "docs").glob("*.md"))]
+# about the tree. The glob is non-recursive because `docs/` is flat by design.
+PROSE = [p for p in (README, *sorted((REPO / "docs").glob("*.md"))) if p.is_file()]
 
 
 def readme() -> str:

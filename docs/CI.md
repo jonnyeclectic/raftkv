@@ -24,13 +24,13 @@ request pays for and what a cron pays for once a night.
 
 ### Why `test` asserts zero skips
 
-Ten files in `tests/` carry `skipif(shutil.which("node") is None)`. They slice blocks
+Eight files in `tests/` carry `skipif(shutil.which("node") is None)`. They slice blocks
 out of the shipped `dashboard.html` and execute them under node, which is the only way to
 test that page's logic by running it rather than grepping it — the page has no build step,
 so a test that re-implements the function it covers passes forever regardless of what the
 browser loads.
 
-Measured on this repository: **386 tests with node present, 298 passed and 88 skipped
+Measured on this repository: **377 tests with node present, 289 passed and 88 skipped
 without it.** On a runner without node the suite still exits 0, still reports success, and
 has silently stopped checking a quarter of itself. Installing node is half the fix. The
 other half is the assertion, because "we installed node" is a belief and "zero tests
@@ -111,7 +111,10 @@ are the two that do, and CI runs the identical scripts.
 
 ## Cadence, and why the expensive things are not on every pull request
 
-`make clean-start-check` removes every container, volume and local image, rebuilds with
+`make clean-start-check` removes every container, volume and local image, refuses if
+anything else still holds ports 8001–8003 (a `run-local` node's specific `127.0.0.1`
+bind would beat compose's wildcard forward, and smoke would test the wrong cluster —
+the symptom is a false `no failover leader` thirty seconds in), rebuilds with
 `--no-cache`, starts the cluster, runs the full smoke, and tears down. It is the gate
 that was previously run by hand before anything that depended on it — which makes it
 exactly as reliable as whoever remembers to run it.

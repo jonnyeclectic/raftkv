@@ -52,11 +52,15 @@ class SimCluster:
     the object but is never consulted again); restart() builds a FRESH RaftNode
     on the SAME db file — exactly what a process restart loses and keeps."""
 
-    def __init__(self, tmp_path, n: int = 3, **overrides):
+    def __init__(self, tmp_path, n: int = 3, transport=None, **overrides):
         from raftkv.transport import MemoryTransport
 
         self.tmp_path = tmp_path
-        self.transport = MemoryTransport()
+        # Injectable so a randomized run can swap in tests/chaos.py's ChaosTransport, which
+        # subclasses MemoryTransport and keeps the crash/partition controls this class
+        # drives. Defaulting to a fresh MemoryTransport keeps every existing caller
+        # unchanged.
+        self.transport = transport if transport is not None else MemoryTransport()
         self.ids = [f"node-{i}" for i in range(1, n + 1)]
         # Applied to every node, and re-applied by restart(). Lets a test widen a single
         # timing knob (a flood needs a commit_timeout that survives a loaded CI box)

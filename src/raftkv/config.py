@@ -22,6 +22,16 @@ class NodeConfig(BaseModel):
     # RAFT_ADMIN_ENABLED=0 and inject failure from the orchestrator
     # (kubectl delete pod / compose stop).
     admin_enabled: bool = True
+    # POST /admin/spawn-node starts ANOTHER raftkv process, so the dashboard can grow the
+    # cluster from three with no terminal. Its own flag rather than riding on
+    # admin_enabled: every other admin route makes THIS process misbehave, while this one
+    # creates new ones, and a deployment that wants the failure controls for a demo should
+    # not have to accept process spawning to get them. See provision.py.
+    provision_enabled: bool = True
+    # How many processes one cluster will start, ever. Same reasoning as flood.MAX_TOTAL:
+    # an unauthenticated endpoint that spawns unbounded processes is a fork bomb with a
+    # REST API. Ordinals stay two digits so the port stays 8000 + N.
+    provision_max_nodes: int = Field(default=12, ge=1, le=90)
     # A learner receives the log but never votes and never campaigns, so adding one
     # does NOT move quorum — which is why it needs no joint consensus (§6). This is how
     # etcd and LogCabin stage a new member before promoting it to a voter.
@@ -70,6 +80,8 @@ class NodeConfig(BaseModel):
             ("election_timeout_max", "RAFT_ELECTION_MAX"),
             ("commit_timeout", "RAFT_COMMIT_TIMEOUT"),
             ("admin_enabled", "RAFT_ADMIN_ENABLED"),
+            ("provision_enabled", "RAFT_PROVISION_ENABLED"),
+            ("provision_max_nodes", "RAFT_PROVISION_MAX"),
             ("learner", "RAFT_LEARNER"),
             ("advertise_addr", "RAFT_ADVERTISE"),
         ]:

@@ -58,9 +58,12 @@ instantly re-elect itself.
 **"From the current leader" means the term is current — not that the append succeeded.**
 The distinction decides a real bug, so it is worth stating rather than leaving to the
 reader. A follower whose log has diverged gets its AppendEntries *rejected* by its own
-consistency check, possibly for many round trips while the leader walks `nextIndex`
-backwards; the thesis (§3.5) has the leader send entry-less AppendEntries during exactly
-that walk, indistinguishable from heartbeats and failing the check by design. Withholding
+consistency check, for at least one round trip and possibly several while the leader walks
+`nextIndex` backwards; the thesis (§3.5) has the leader send entry-less AppendEntries
+during exactly that walk, indistinguishable from heartbeats and failing the check by
+design. (The §5.3 conflict hint makes that walk short — a couple of round trips rather
+than one per missing entry, see [FAILURE_MODES.md](FAILURE_MODES.md) — but it does not
+make it empty, and one rejected append is enough for this bug.) Withholding
 the timer reset until an append succeeds means that follower times out and deposes a
 perfectly healthy leader *while it is being repaired* — the repair then restarts under a
 new leader, and a cluster with one lagging node can churn indefinitely.
@@ -71,8 +74,7 @@ same order (`raft.go`, `stepFollower`: `r.electionElapsed = 0; r.lead = m.From;
 r.handleAppendEntries(m)`). Getting this wrong is a liveness failure, not a safety one —
 no committed entry is ever lost by it — which is why it survives casual testing and shows
 up only as unexplained leader churn. Pinned by
-`tests/test_append_entries.py::test_a_failed_consistency_check_still_resets_the_timer` and
-`tests/test_append_entries.py::test_a_failed_consistency_check_still_records_the_leader`.
+`tests/test_append_entries.py::test_a_failed_consistency_check_still_resets_the_timer`.
 
 ## Leader election
 

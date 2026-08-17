@@ -38,6 +38,18 @@ services:
   # Started but NOT a member: no peers, never campaigns, invisible to the other three
   # until the dashboard's "add node" attaches it as a learner. RAFT_ADVERTISE is what
   # the leader dials — the published 8004 only exists for the browser.
+  #
+  # DECLARED HERE rather than provisioned on demand, which is what run-local now does
+  # (the dashboard's `provision node` button, POST /admin/spawn-node). A container cannot
+  # spawn its own siblings: a child started inside raft-node-1 gets raft-node-1's network
+  # namespace, so the address it advertises resolves — for every peer that dials it — to
+  # that peer's own loopback. The attach succeeds and replication never connects, which
+  # reads as a Raft bug and is a topology mistake. provision.py refuses to run in a
+  # container for exactly that reason, so this runtime ships the two nodes instead.
+  #
+  # Growing a compose cluster past node-5 is a service block plus two volumes, then
+  # `docker compose up -d raft-node-6` — deliberately a file edit, because each node needs
+  # a unique id, port and volume pair that `--scale` cannot produce.
   raft-node-4:
     build: .
     ports: ["8004:8000"]

@@ -363,6 +363,13 @@
           <button id="setbtn" type="button" class="primary">set on leader</button>
           <button id="delbtn" type="button">delete</button>
         </div>
+        <!-- Growing the cluster is TWO steps, and this is the first one. It starts a
+             process; the process joins nothing. The staged row is what step one looks
+             like, and `attach as learner` on its card is step two. -->
+        <div class="ctl">
+          <button id="provbtn" type="button">provision node</button>
+          <span class="label">starts a process · in no cluster until attached</span>
+        </div>
         <!-- Escape hatch for an address this tab is not probing (a kubectl port-forward,
              a node on another host). The staged cards are the normal path. -->
         <div class="ctl">
@@ -454,8 +461,11 @@ let NODES = (params.get("nodes")
    address that has never answered cannot be classified, and a 3-node deployment showing
    two permanent unreachable cards is worse than not knowing.
 
-   The default is the two idle nodes run_local.sh and compose always start. `?probe=`
-   extends it for a node provisioned mid-demo (`make node-up N=6` prints the URL), and
+   The default is 8004 and 8005: where the first two `provision node` presses land, and
+   also the two idle nodes compose still ships pre-declared. So the common case needs no
+   query string — a provisioned node-4 is already being knocked on. Above that,
+   registerProvisioned() appends to this list at runtime; `?probe=` does the same thing
+   for a node this tab did not start (`make node-up N=6` prints the URL), and
    the list is deliberately NOT open-ended: every address here is fetched twice a second
    forever, so an unused slot is a console full of ERR_CONNECTION_REFUSED for the rest
    of the session. A bare number means 127.0.0.1; anything that is not host:port is
@@ -610,6 +620,45 @@ function isStaged(s) {
 function memberAddrs() { return NODES.filter(a => !isStaged(states[a])); }
 function stagedAddrs() { return NODES.filter(a => isStaged(states[a])); }
 /* --- end node classification ------------------------------------------------------ */
+
+/* --- provisioning (behaviour pinned by tests/test_dashboard_provision.py) ----------
+   Which node to ask for a new PROCESS, and what to do with the address it hands back.
+   Two decisions, both wrong in ways that only surface live.
+
+   Ask the LEADER when one is visible. Provisioning is not a Raft operation -- every node
+   shares a host, so any of them could spawn the process -- but the attach that follows IS
+   leader-only, and sending both to one node keeps the event feed readable: the
+   `node_provisioned` line and the `learner_added` line arrive from the same card instead
+   of two. With no leader (mid-election, or a partition with no majority) fall back to any
+   answering MEMBER. A staged node can spawn perfectly well, but asking a node that is in
+   no configuration to grow the cluster reads as an accident even when it works.
+
+   Return the address into PROBE, never straight into NODES. NODES is card order, and a
+   card drawn before discovery has classified the node renders for one tick as a member
+   with an empty log -- the flicker the staged row exists to avoid. Via PROBE, discover()
+   adopts it on the next tick in probe order, the same path node-4 has always taken. */
+function provisionTarget(states, NODES) {
+  let leader = null;
+  for (const addr of NODES) {
+    const s = states[addr];
+    if (!s || s.role !== "leader" || s.learner) continue;
+    if (!leader || s.term > states[leader].term) leader = addr;
+  }
+  if (leader) return leader;
+  const member = NODES.find(a => {
+    const s = states[a];
+    return !!s && Object.keys(s.config?.voters ?? {}).length > 0;
+  });
+  return member ?? null;
+}
+
+function registerProvisioned(addr, PROBE) {
+  if (!/^[A-Za-z0-9.-]+:\d+$/.test(addr || "")) return false;
+  if (PROBE.includes(addr)) return false;  // already knocked on twice a second
+  PROBE.push(addr);
+  return true;
+}
+/* --- end provisioning -------------------------------------------------------------- */
 
 /* --- leader selection (behaviour pinned by tests/test_dashboard_leader.py) ---------
    HIGHEST TERM wins, never first-seen. Raft guarantees one leader PER TERM, not one
@@ -1411,6 +1460,40 @@ async function addNode() {
   if (await attach(addr)) input.value = "";
 }
 
+// Step ONE of growing the cluster: start a process. It comes back staged -- a learner
+// with an empty voter set, in nobody's configuration -- and stays that way until someone
+// presses attach. Deliberately two presses; see provision.py.
+//
+// The 20 s abort is longer than the server's 15 s health wait on purpose: if the child is
+// slow to boot, the server should be the one that gives up and says why, because it can
+// see the process and this page cannot.
+async function provisionNode() {
+  const target = provisionTarget(states, NODES);
+  if (!target) return setStatus("no node available to provision from", "err");
+  const btn = document.getElementById("provbtn");
+  if (btn) btn.disabled = true;   // a second press mid-spawn takes the next slot too
+  setStatus(`asking ${target} to start another node...`);
+  try {
+    const r = await fetch(`http://${target}/admin/spawn-node`, {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: "{}",
+      signal: AbortSignal.timeout(20000),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      setStatus(`provision failed: ${d.detail ?? d.error ?? r.status}`, "err");
+      return;
+    }
+    registerProvisioned(d.addr, PROBE);
+    setStatus(`${d.node_id} running on ${d.addr} — staged; attach it to join`, "ok");
+  } catch (e) {
+    setStatus(`provision failed: ${e}`, "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function attach(addr) {
   const leader = leaderAddr();
   if (!leader) { setStatus("no leader visible", "err"); return false; }
@@ -1621,6 +1704,7 @@ function frame(ts) {
 
 document.getElementById("setbtn")?.addEventListener("click", write);
 document.getElementById("delbtn")?.addEventListener("click", removeKey);
+document.getElementById("provbtn")?.addEventListener("click", provisionNode);
 document.getElementById("addbtn")?.addEventListener("click", addNode);
 document.getElementById("healbtn")?.addEventListener("click", healAll);
 document.getElementById("resetbtn")?.addEventListener("click", resetAll);

@@ -8,3 +8,10 @@ data/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+
+# IDE scratch — machine-local, never part of the deliverable
+.idea/
+
+# playwright-mcp scratch output (screenshots, a11y snapshots) -- never part of the deliverable
+.playwright-mcp/
+
