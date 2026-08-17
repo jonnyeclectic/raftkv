@@ -95,14 +95,23 @@ dissertation.
 
 ## The throughput ceiling, measured
 
-`/admin/flood` exists to make this reproducible rather than theoretical. On this machine,
-in-process over `MemoryTransport` with no network at all:
+`/admin/flood` exists to make this reproducible rather than theoretical. Driven from the
+dashboard against the real three-node cluster over HTTP, on an otherwise idle machine:
 
-| Concurrent writes | Wall clock | Outcome |
+| Writes, all at once | Wall clock | Outcome |
 |---|---|---|
-| 200 | 0.09 s | all committed |
-| 500 | 2.30 s | 499 commit-timeout, 1 rejected |
-| 1000 | 3.08 s | all commit-timeout |
+| 200 | 0.1 s | all committed, 2381/s |
+| 500 | 0.5 s | all committed, 1111/s |
+| 1000 | 1.7 s | all committed, 572/s |
+| 2000 | 10.9 s | **all 2000 commit-timeout**, one election, 0/s |
+
+Throughput *falls* as the burst grows — 2381/s at 200, 572/s at 1000 — which is the
+super-linear cost showing up before the cliff does. Between 1000 and 2000 it goes over.
+
+Quote these numbers, not the ones an earlier revision of this file carried. Those were
+measured in-process over `MemoryTransport` while two other jobs saturated the CPU, and
+they put the cliff at 500 — five times pessimistic. The mechanism was right; the numbers
+described the machine, not the system.
 
 The mechanism is not the network and not fsync — it is `_advance_commit_index()`. It scans
 the log downward from `last_log_index` to `commit_index`, one SQLite `term_at()` query per
@@ -114,12 +123,31 @@ heartbeat is late, the followers elect around a leader that is merely busy, and 
 in-flight write fails at once.
 
 Two things follow that are worth saying out loud. The cliff is **load-dependent, not a
-fixed number**: the same 200-write burst that takes 0.09 s idle collapses to 100%
-commit-timeout when the CPU is contended, which is why `tests/test_flood.py` asserts
-invariants and never latency. And the failure is **safe** — writes are refused, never
-lost or misordered. Every node still converges on the same key-value state, and the
-surviving value for a contended key is still the one the log ordered last. Degradation
-under overload is a liveness problem here, not a safety one.
+fixed number**: 500 concurrent writes commit cleanly in 0.5 s on an idle machine and time
+out entirely when the CPU is contended — same code, same cluster. That is why
+`tests/test_flood.py` asserts invariants and never latency or a success count, and it is
+why the table above names the conditions it was measured under.
+
+And the failure is **safe**. Measured immediately after the 2000-write burst timed out
+every single client:
+
+```
+node-1 follower  term 2  log 2702  commit 2702  applied 2702  1000 keys
+node-2 follower  term 2  log 2702  commit 2702  applied 2702  1000 keys
+node-3 LEADER    term 2  log 2702  commit 2702  applied 2702  1000 keys   -> all agree
+```
+
+Nothing lost, nothing misordered, no node left behind: the writes were *refused*. The term
+moved 1 → 2 because the starved heartbeat did cost the leader its leadership, which is the
+mechanism above showing up as an election rather than as corruption. A surviving value for
+a contended key is still the one the log ordered last. Degradation under overload is a
+liveness problem here, not a safety one — and that distinction is the whole point of
+having the flood.
+
+One nuance the counters hide: a client `timeout` does **not** mean the entry never
+committed. Those 2000 writes were appended and the survivors committed after the client
+had already given up at `commit_timeout`. That is the at-least-once story in the omissions
+table above, seen live rather than argued.
 
 ## When a learner can safely be promoted
 
