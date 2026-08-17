@@ -30,7 +30,7 @@ test that page's logic by running it rather than grepping it — the page has no
 so a test that re-implements the function it covers passes forever regardless of what the
 browser loads.
 
-Measured on this repository: **372 tests with node present, 284 passed and 88 skipped
+Measured on this repository: **386 tests with node present, 298 passed and 88 skipped
 without it.** On a runner without node the suite still exits 0, still reports success, and
 has silently stopped checking a quarter of itself. Installing node is half the fix. The
 other half is the assertion, because "we installed node" is a belief and "zero tests
