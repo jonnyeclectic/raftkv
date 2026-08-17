@@ -70,9 +70,10 @@ Per-node builds are under each card's **infrastructure** section.
 | `tests/test_logging_setup.py` | JSON format, rolling files, ring buffer, the PII-redaction guarantee |
 | `tests/test_storage.py` | Durability across reopen; atomic apply with `last_applied` |
 | `tests/test_transport.py` | HTTP error mapping; memory-transport crash/partition semantics |
-| `tests/test_election_rules.py` | RequestVote receiver rules (unit, no timers) |
-| `tests/test_append_entries.py` | AppendEntries receiver rules: consistency check, conflict-only truncation |
-| `tests/test_election_flow.py` | Candidate side with mockito-stubbed peers |
+| `tests/test_apply_loop.py` | The single applier: committed prefix only, in order, resuming at `last_applied`, stepping over no-ops and config entries |
+| `tests/test_election_rules.py` | RequestVote receiver rules and term observation (unit, no timers) |
+| `tests/test_append_entries.py` | AppendEntries receiver rules: consistency check, conflict-only truncation, commit-index monotonicity, timer/leader-id ordering |
+| `tests/test_election_flow.py` | Candidate side with mockito-stubbed peers, the election timer loop, and the leader's opening no-op |
 | `tests/test_replication.py` | Leader side: matchIndex discipline, commit rule, stale-reply guards |
 | `tests/test_simulation.py` | Real timers over a simulated network: partition, failover, divergence, restart |
 | `tests/test_api.py` | HTTP contract: KV round-trip, 503 + leader hint, structured errors, `/logs` redaction |
@@ -107,8 +108,8 @@ Per-node builds are under each card's **infrastructure** section.
 
 | Layer | File | What it proves |
 |---|---|---|
-| Rule units (sync, no timers) | `tests/test_election_rules.py`, `tests/test_append_entries.py` | Each Raft receiver rule in isolation: vote restriction, one vote per term, consistency check, conflict-only truncation, timer-reset discipline |
-| Mockito-stubbed flows | `tests/test_election_flow.py`, `tests/test_replication.py` | Candidate and leader async flows with stubbed peers: quorum counting, stale-reply rejection, step-down on higher term, commit rule |
+| Rule units (sync, no timers) | `tests/test_election_rules.py`, `tests/test_append_entries.py`, `tests/test_apply_loop.py` | Each Raft receiver rule in isolation: vote restriction, one vote per term, consistency check, conflict-only truncation, timer-reset discipline, commit-index monotonicity, and an applier that drains the committed prefix in order without stalling on a no-op |
+| Mockito-stubbed flows | `tests/test_election_flow.py`, `tests/test_replication.py` | Candidate and leader async flows with stubbed peers: quorum counting, stale-reply rejection, step-down on higher term, commit rule, and three followers at three nextIndex values each getting their own slice |
 | Foundation units | `tests/test_models.py`, `tests/test_config.py`, `tests/test_logging_setup.py`, `tests/test_storage.py`, `tests/test_transport.py` | Shapes validate, timing ratios enforced, logs redact values, storage survives reopen atomically |
 | Simulated-network scenarios | `tests/test_simulation.py` | Whole-cluster behavior under real timers: stable election, failover + rejoin, partitioned leader cannot commit and is repaired on heal, catch-up, restart durability |
 | API contract | `tests/test_api.py` | HTTP surface: KV round-trip, follower 503 + `leader_id`, validation errors, structured 500s, `/logs` |

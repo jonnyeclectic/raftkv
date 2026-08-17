@@ -106,3 +106,40 @@ def test_deposed_leader_timer_is_reset(make_node):
     node._observe_term(9)  # e.g. a higher term seen in an RPC response
     assert node.role is Role.FOLLOWER
     assert node._last_reset > 0.0
+
+
+def test_grants_vote_when_the_logs_are_exactly_equal(make_node):
+    """§5.4.1 compares with >=, not >. Two in-sync nodes are the common case, so a
+    strict > here means a healthy cluster can never elect anyone."""
+    node = make_node()
+    node.storage.append([entry(term=2, rid="a"), entry(term=2, rid="b")])
+    assert node.handle_request_vote(vote_req(term=3, last_idx=2, last_term=2)).vote_granted
+
+
+def test_grants_vote_when_our_own_log_is_empty(make_node):
+    node = make_node()
+    assert node.storage.last_log_index() == 0
+    assert node.handle_request_vote(vote_req(term=2, last_idx=7, last_term=3)).vote_granted
+    assert node.voted_for == "node-2"
+
+
+def test_observe_term_never_moves_the_term_backwards(make_node):
+    node = make_node()
+    node.current_term = 5
+    node.role = Role.LEADER
+    node._observe_term(2)
+    assert node.current_term == 5
+    assert node.role is Role.LEADER  # and a stale term does not depose us
+
+
+def test_each_reset_draws_a_timeout_inside_the_configured_range(make_node):
+    """§5.2 requires randomization per reset. A fixed timeout makes every follower
+    campaign on the same tick, split the vote, and repeat."""
+    node = make_node()
+    low, high = node.cfg.election_timeout_range
+    drawn = set()
+    for _ in range(50):
+        node._reset_election_timer()
+        assert low <= node._election_timeout <= high
+        drawn.add(node._election_timeout)
+    assert len(drawn) > 1

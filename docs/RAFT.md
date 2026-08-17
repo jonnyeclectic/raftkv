@@ -70,7 +70,9 @@ the consistency check, and only a stale *term* skips the reset. etcd does the sa
 same order (`raft.go`, `stepFollower`: `r.electionElapsed = 0; r.lead = m.From;
 r.handleAppendEntries(m)`). Getting this wrong is a liveness failure, not a safety one —
 no committed entry is ever lost by it — which is why it survives casual testing and shows
-up only as unexplained leader churn.
+up only as unexplained leader churn. Pinned by
+`tests/test_append_entries.py::test_a_failed_consistency_check_still_resets_the_timer` and
+`tests/test_append_entries.py::test_a_failed_consistency_check_still_records_the_leader`.
 
 ## Leader election
 
