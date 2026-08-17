@@ -104,10 +104,18 @@ class Storage:
         ).fetchone()
         return row[0] if row else None
 
-    def entries_from(self, start: int) -> list[LogEntry]:
-        """Every entry from `start` onward."""
+    def entries_from(self, start: int, limit: int | None = None) -> list[LogEntry]:
+        """Entries from `start` onward, at most `limit` of them.
+
+        The limit is pushed into SQL rather than applied to the result: a leader that is
+        3000 entries ahead of a follower should not decode 3000 rows into pydantic models
+        to send 512 of them, once per replication round, per peer."""
+        if limit is not None and limit <= 0:
+            return []
         rows = self._conn.execute(
-            "SELECT term, command FROM log WHERE idx >= ? ORDER BY idx", (start,)
+            "SELECT term, command FROM log WHERE idx >= ? ORDER BY idx"
+            + ("" if limit is None else " LIMIT ?"),
+            (start,) if limit is None else (start, limit),
         ).fetchall()
         return [
             LogEntry(term=t, command=_ENTRY_COMMAND.validate_python(json.loads(c)))

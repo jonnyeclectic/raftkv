@@ -32,6 +32,21 @@ from raftkv.transport import Transport, TransportError
 
 logger = logging.getLogger("raftkv.raft")
 
+# Most entries in one AppendEntries. The batch used to be unbounded — every outstanding
+# entry, to every follower, every round — so a burst of N in flight shipped an O(N)
+# payload per peer per round and paid to decode it out of SQLite each time. Measured at
+# 2000 pending: ~195 KiB per peer and ~33 ms of event-loop time per round across four
+# followers, work that repeats until the burst drains.
+#
+# The number is a payload budget, not a tuning dial: at roughly 100 bytes an entry this
+# caps one message near 50 KiB. Raising it walks back toward the unbounded behaviour;
+# lowering it costs more round trips, which is cheap ONLY because a successful append
+# that leaves a follower behind re-fires replication immediately instead of waiting for
+# the next heartbeat (see _append_to_peer). Change one without the other and catch-up
+# after a flood goes back to taking minutes.
+MAX_ENTRIES_PER_APPEND = 512
+
+
 class NotLeaderError(Exception):
     def __init__(self, leader_id: str | None) -> None:
         super().__init__(f"not the leader; try {leader_id or 'unknown'}")
@@ -478,7 +493,9 @@ class RaftNode:
         if prev_term is None:  # our log shrank under this nextIndex (deposed+truncated)
             self.next_index[peer_id] = self.storage.last_log_index() + 1
             return
-        entries = self.storage.entries_from(self.next_index[peer_id])
+        entries = self.storage.entries_from(
+            self.next_index[peer_id], limit=MAX_ENTRIES_PER_APPEND
+        )
         req = AppendEntriesRequest(
             term=term_when_sent, leader_id=self.cfg.node_id,
             prev_log_index=prev_index, prev_log_term=prev_term,
@@ -500,6 +517,13 @@ class RaftNode:
             self.match_index[peer_id] = prev_index + len(entries)
             self.next_index[peer_id] = self.match_index[peer_id] + 1
             self._advance_commit_index()
+            if self.match_index[peer_id] < self.storage.last_log_index():
+                # Still behind, and the batch is capped — so ask for another round NOW
+                # rather than at the next heartbeat. Without this the cap would turn a
+                # catch-up into ceil(behind / MAX_ENTRIES_PER_APPEND) HEARTBEATS, which
+                # is exactly the slow repair §5.3 was added to remove. Only a successful
+                # append re-fires, so an unreachable or rejecting peer cannot spin here.
+                self._replicate_now.set()
         else:
             self.next_index[peer_id] = self._next_index_after_rejection(peer_id, resp)
 
