@@ -33,6 +33,21 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- last_config() runs on EVERY log mutation, because membership is a view over the log
+-- rather than a cache beside it (§6, and _reload_config()'s whole reason to exist). That
+-- makes its cost part of the write path: unindexed it is a full SCAN, so it grew with the
+-- log and 1000 concurrent writes against a 15,000-entry log cost ~2.5 s of event-loop
+-- time -- past the 1.5 s election floor, so the leader was voted out for being busy.
+--
+-- A PARTIAL index, matching the query's WHERE clause exactly, so SQLite can use it: it
+-- indexes only the handful of configuration entries rather than every client command.
+-- Measured at 15,000 entries: 2.466 ms -> 0.004 ms, and the plan changes from `SCAN log`
+-- to `SCAN log USING INDEX log_config`. Semantics are untouched -- the configuration is
+-- still read out of the log, so truncating a config entry still reverts to the previous
+-- one for free. Change last_config()'s WHERE clause and this index silently stops
+-- applying; the query goes back to a scan and only a big log shows it.
+CREATE INDEX IF NOT EXISTS log_config ON log(idx)
+    WHERE json_extract(command, '$.op') = 'config';
 """
 
 
