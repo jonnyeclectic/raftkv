@@ -55,6 +55,16 @@ class SpawnNode(BaseModel):
     ordinal: int | None = Field(default=None, ge=FIRST_ORDINAL, le=99)
 
 
+class Timing(BaseModel):
+    """Runtime timing override — the cluster's tempo control. Only the three election
+    knobs: `rpc_timeout` stays startup-only because `HttpTransport` holds its own
+    client timeout, so a runtime change here would silently not propagate."""
+
+    heartbeat_interval: float | None = Field(default=None, gt=0, le=60)
+    election_timeout_min: float | None = Field(default=None, gt=0, le=600)
+    election_timeout_max: float | None = Field(default=None, gt=0, le=600)
+
+
 class Partition(BaseModel):
     """Replace semantics: the full set of peers this node cannot talk to. []=healed."""
 
@@ -219,6 +229,55 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             log_event(logger, "admin_partition", node=cfg.node_id, blocked=sorted(node.blocked))
             return {"ok": True, "node": cfg.node_id, "blocked": sorted(node.blocked)}
+
+        @app.post("/admin/campaign")
+        async def admin_campaign() -> dict:
+            """Make THIS node start an election immediately — a way of choosing who
+            leads, so a debugger can step leader paths on node-1, or hand leadership
+            to a peer and step follower paths instead.
+            409 for the two nodes it cannot help: a sitting leader and a learner."""
+            refuse_if_crashed()
+            try:
+                await node.campaign()
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            log_event(logger, "admin_campaign", node=cfg.node_id, term=node.current_term)
+            return {
+                "ok": True, "node": cfg.node_id,
+                "term": node.current_term, "role": node.role,
+            }
+
+        @app.post("/admin/timing")
+        async def admin_timing(body: Timing) -> dict:
+            """Update this node's election/heartbeat timing live, without a restart.
+
+            The merged result is validated as a WHOLE NodeConfig before any field is
+            touched, so the startup ratio rules (§5.2) hold mid-flight too — this
+            knob exists to steer elections, not to configure the pathological
+            cluster those rules prevent. In-place on the shared config object, so
+            the running timers pick it up at their next arm (for a follower under
+            heartbeat, within one heartbeat). Deliberately not persisted: a restart
+            restores the env-derived config, which is what a reset wants."""
+            refuse_if_crashed()
+            updates = {k: v for k, v in body.model_dump().items() if v is not None}
+            if not updates:
+                raise HTTPException(status_code=422, detail="no timing field provided")
+            try:
+                NodeConfig.model_validate({**cfg.model_dump(), **updates})
+            except ValidationError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            for field, value in updates.items():
+                setattr(cfg, field, value)
+            log_event(logger, "admin_timing", node=cfg.node_id, **updates)
+            return {
+                "ok": True, "node": cfg.node_id,
+                "timing": {
+                    "heartbeat_interval": cfg.heartbeat_interval,
+                    "election_timeout_min": cfg.election_timeout_min,
+                    "election_timeout_max": cfg.election_timeout_max,
+                    "rpc_timeout": cfg.rpc_timeout,
+                },
+            }
 
         @app.post("/admin/promote")
         async def admin_promote(body: Promote) -> dict:

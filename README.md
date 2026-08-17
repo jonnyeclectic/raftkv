@@ -109,6 +109,7 @@ Per-node builds are under each card's **infrastructure** section.
 | `tests/test_dashboard_voters.py` | The per-card "N voting" summary, run under node: counted from the configuration rather than the transport peer map, so a learner no longer counts itself |
 | `tests/test_provision.py` | `POST /admin/spawn-node`: the argv is a constant shaped by one integer (no shell, nothing interpolated), the cap holds on both allocation paths (an explicit ordinal cannot skip the window), node-4 is the floor, a child that never answers is reaped, and it refuses inside a container where the process would be unreachable by design |
 | `tests/test_dashboard_provision.py` | Which node is asked to provision and what happens to the address it returns, run under node: the highest-term leader, never a learner or a staged node, falling back to a member mid-election — and the address joins the probe list rather than the card list |
+| `tests/test_admin_timing.py` | The tempo controls: a live timing update is revalidated as a whole config (the §5.2 ratios hold mid-flight) and reaches the running timer without a restart; `campaign` elects exactly the node asked, refuses a sitting leader, and never moves a learner |
 | `tests/test_chaos_soak.py` | Randomized message schedules against the safety properties: a seeded hostile network, faults drawn rather than scripted, and a reproducible seed on any failure |
 | `tests/test_ci_gate.py` | The gating policy tested like the rest of the system: one un-skippable required check, and every job in `ci.yml` reachable from its `needs` |
 | `tests/test_docs_matrix.py` | These tables, in both directions: every test file has a row, every row names a file that exists, every doc is linked — plus every `tests/…::test_name` cited anywhere in the shipped prose, down to the test name |
@@ -120,7 +121,7 @@ Per-node builds are under each card's **infrastructure** section.
 | `Dockerfile` | `python:3.14-slim`, non-root user, uvicorn entrypoint |
 | `docker-compose.yml` | Three voting nodes on 8001–8003 plus an idle learner on 8004, healthchecks, named volumes |
 | `k8s/raftkv.yaml` | StatefulSet + headless Service (stable peer DNS) for kind |
-| `docs/` | Architecture, Raft walkthrough, failure modes, overview |
+| `docs/` | Code tour, architecture, Raft walkthrough, failure modes, overview, CI |
 
 ## Test matrix
 
@@ -139,7 +140,7 @@ Per-node builds are under each card's **infrastructure** section.
 | Build provenance | `tests/test_build_stamp.py` | The stamp describes the bytes it claims to: `ui` is recomputed per request (never cached), `srv` is frozen at import, the served page carries its own hash with no placeholder left behind, `/build` answers even while crashed, and nodes on different builds report `MIXED` rather than agreement |
 | Performance regressions | `tests/test_log_repair.py`, `tests/test_gap_repair.py`, `tests/test_append_batching.py`, `tests/test_commit_scan.py`, `tests/test_config_lookup.py` | The four costs that were measured rather than guessed, each pinned so it cannot come back: one-index backtracking, the unbounded batch, the O(N²) commit walk, and the unindexed configuration lookup |
 | Randomized schedules | `tests/test_chaos_soak.py` | The properties that must hold on *every* path, not the outcome of one scripted scenario. A seeded `ChaosTransport` delays, drops, duplicates and reorders RPCs while faults are drawn rather than written, and after every step all five Raft safety properties (§5.4.3) are checked cluster-wide, ending with the client-visible promise that an acknowledged write is never lost. The delay is the point: it holds open the stale-reply window that the guards in `raft.py` exist for and that an instant transport almost never opens. Four seeds inline; `RAFT_SOAK_SEEDS=500` widens it for a nightly run |
-| Repo as deliverable | `tests/test_ci_gate.py`, `tests/test_docs_matrix.py` | The gate cannot fail open, and the documentation cannot drift from the tree: every test file has a matrix row and every row a file, every doc is linked, and every citation in the prose resolves — to the file *and* to the named test. Markdown is the one claim here that no import checks, so a refactor that renames a test used to leave the paragraph explaining it silently pointing at nothing |
+| Repo as deliverable | `tests/test_ci_gate.py`, `tests/test_docs_matrix.py` | The gate cannot fail open, and the documentation cannot drift from the tree: every test file has a matrix row and every row a file, every doc is linked, and every citation in the prose resolves — to the file *and* to the named test, and for `docs/CODE_TOUR.md`'s navigation to the named **source symbol** too. Markdown is the one claim here that no import checks, so a refactor that renames a test used to leave the paragraph explaining it silently pointing at nothing; the tour navigates by symbol rather than line number for exactly that reason, since a line number cannot be checked and rots on the next edit |
 | Compose smoke | `scripts/smoke.sh` | The real containers do all of the above end to end |
 
 ## Make targets
@@ -170,6 +171,7 @@ Per-node builds are under each card's **infrastructure** section.
 
 ## Docs
 
+- [docs/CODE_TOUR.md](docs/CODE_TOUR.md) — where to start reading, the five call paths, and where to put a breakpoint
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, concurrency model, SQLite schema, component + deployment diagrams
 - [docs/RAFT.md](docs/RAFT.md) — plain-language Raft walkthrough with sequence diagrams
 - [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md) — handled failures and deliberate omissions, as tables

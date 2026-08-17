@@ -56,6 +56,7 @@ def test_the_pasteable_config_block_names_no_ambiguous_address():
     the one address on this path that can reach two different clusters -- localhost
     resolves to 127.0.0.1 or ::1, a compose cluster publishes on both, and a local node
     binds only the first. The symptom is a dashboard showing a mix of the two, which
+    reads as Raft misbehaving. Observed in practice, not hypothetical."""
     doc = SCRIPT.read_text()
     block = doc[doc.index("Run/Debug configuration:"):doc.index("Breakpoints:")]
     assert "localhost:800" not in block, "the pasted peer list can reach two clusters"

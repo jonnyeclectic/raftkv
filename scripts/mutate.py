@@ -131,6 +131,11 @@ MUTATIONS = [
     ("provision: explicit ordinal skips the cap window", "provision.py",
      "    elif ordinal >= FIRST_ORDINAL + max_nodes:",
      "    elif False:"),
+
+    # ---- runtime tempo controls ----
+    ("campaign: learner allowed to campaign", "raft.py",
+     '        if not self.is_voter:\n            raise ValueError("this node is a learner; learners never campaign (§6)")',
+     "        if False:\n            raise ValueError('unreachable')"),
 ]
 
 

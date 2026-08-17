@@ -270,6 +270,29 @@ class RaftNode:
         )
 
     # ---- candidacy (async: every await yields — re-validate state after) ---
+    async def campaign(self) -> None:
+        """Start an election NOW, on request — `POST /admin/campaign`, the steering
+        wheel for leadership.
+
+        A simplified stand-in for leadership transfer (thesis §3.10): no TimeoutNow
+        RPC, the operator simply tells a chosen node to stop waiting for its
+        randomized timer. Everything that makes an election safe is unchanged — the
+        term bump, the persisted vote, the up-to-date-log check on every granter — so
+        the worst a press can do is burn a term and lose, exactly like a timeout
+        firing early. It is also how leadership is handed to a peer so that node-1's
+        FOLLOWER paths can sit on a breakpoint.
+
+        Two refusals, mirroring `_election_timer_loop`'s own guards: a current leader
+        asking to be elected is a no-op wearing a button, and a learner never
+        campaigns — a node outside every voter set can only waste a term it cannot
+        win (§6).
+        """
+        if not self.is_voter:
+            raise ValueError("this node is a learner; learners never campaign (§6)")
+        if self.role is Role.LEADER:
+            raise ValueError(f"already the leader (term {self.current_term})")
+        await self._start_election()
+
     async def _start_election(self) -> None:
         self.role = Role.CANDIDATE
         self.current_term += 1
