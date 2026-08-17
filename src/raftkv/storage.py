@@ -87,7 +87,25 @@ class Storage:
             return None
         return LogEntry(term=row[0], command=_ENTRY_COMMAND.validate_python(json.loads(row[1])))
 
+    def first_index_of_term(self, term: int) -> int | None:
+        """Lowest index we hold for `term`, or None if we hold none.
+
+        Only used to build and consume the §5.3 conflict hint, which is why both ends of
+        a term run are needed: the follower names where its run of a term STARTS, the
+        leader answers with where its own run of that term ENDS."""
+        row = self._conn.execute(
+            "SELECT MIN(idx) FROM log WHERE term = ?", (term,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def last_index_of_term(self, term: int) -> int | None:
+        row = self._conn.execute(
+            "SELECT MAX(idx) FROM log WHERE term = ?", (term,)
+        ).fetchone()
+        return row[0] if row else None
+
     def entries_from(self, start: int) -> list[LogEntry]:
+        """Every entry from `start` onward."""
         rows = self._conn.execute(
             "SELECT term, command FROM log WHERE idx >= ? ORDER BY idx", (start,)
         ).fetchall()

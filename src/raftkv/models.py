@@ -100,6 +100,12 @@ class AppendEntriesRequest(BaseModel):
 class AppendEntriesResponse(BaseModel):
     term: int
     success: bool
+    # §5.3 accelerated backtracking. Set only on a consistency-check rejection, and
+    # OPTIONAL on purpose: a stale-term rejection carries no useful hint, and a peer
+    # running older code sends none at all. Both cases fall back to the naive one-index
+    # walk rather than to a wrong jump — see RaftNode._next_index_after_rejection.
+    conflict_index: int | None = None
+    conflict_term: int | None = None
 
 
 class Metrics(BaseModel):

@@ -32,7 +32,6 @@ from raftkv.transport import Transport, TransportError
 
 logger = logging.getLogger("raftkv.raft")
 
-
 class NotLeaderError(Exception):
     def __init__(self, leader_id: str | None) -> None:
         super().__init__(f"not the leader; try {leader_id or 'unknown'}")
@@ -205,7 +204,7 @@ class RaftNode:
         self._reset_election_timer()  # AppendEntries from current leader: legal reset
         # Rule 5 (§5.3): consistency check — heartbeats run it too.
         if self.storage.term_at(req.prev_log_index) != req.prev_log_term:
-            return AppendEntriesResponse(term=self.current_term, success=False)
+            return self._consistency_failure(req.prev_log_index)
         # Conflict-only truncation (§5.3): never chop entries that already match.
         for offset, incoming in enumerate(req.entries):
             idx = req.prev_log_index + 1 + offset
@@ -227,6 +226,40 @@ class RaftNode:
             self.commit_index = min(req.leader_commit, last_new_entry)
             self._apply_ready.set()
         return AppendEntriesResponse(term=self.current_term, success=True)
+
+    def _consistency_failure(self, prev_log_index: int) -> AppendEntriesResponse:
+        """Reject an AppendEntries, and tell the leader WHERE to resume (§5.3).
+
+        Synchronous like every other rule method — it only reads storage and returns.
+
+        Without a hint the leader walks nextIndex back one index per round trip. Measured
+        against this cluster: ~2 rejections/second, so a follower wiped by /admin/reset
+        while the log held 6224 entries needed ~52 minutes to rejoin, during which it
+        shows an empty state machine and looks broken. The hint costs two integers.
+
+        Two cases, and they are different questions:
+          * our log is too SHORT — no entry at that index at all. The leader should
+            resume at the first index we are missing; nothing above it can ever match.
+          * we hold that index under a DIFFERENT term. That whole run of the term is
+            suspect, so name the term and the first index we hold for it, which lets the
+            leader skip its own copy of that term in one step instead of one per entry.
+
+        The hint is advice, never authority: the leader still runs the consistency check
+        at wherever it resumes, so a wrong hint costs a round trip and cannot corrupt a
+        log."""
+        our_term = self.storage.term_at(prev_log_index)
+        if our_term is None:  # our log is too short to have an opinion about that index
+            return AppendEntriesResponse(
+                term=self.current_term,
+                success=False,
+                conflict_index=self.storage.last_log_index() + 1,
+            )
+        return AppendEntriesResponse(
+            term=self.current_term,
+            success=False,
+            conflict_term=our_term,
+            conflict_index=self.storage.first_index_of_term(our_term) or 1,
+        )
 
     # ---- candidacy (async: every await yields — re-validate state after) ---
     async def _start_election(self) -> None:
@@ -468,9 +501,34 @@ class RaftNode:
             self.next_index[peer_id] = self.match_index[peer_id] + 1
             self._advance_commit_index()
         else:
-            self.next_index[peer_id] = max(1, self.next_index[peer_id] - 1)
-            # naive backoff — one step per rejection; swap in
-            # conflictIndex/conflictTerm accelerated backtracking if logs get long.
+            self.next_index[peer_id] = self._next_index_after_rejection(peer_id, resp)
+
+    def _next_index_after_rejection(
+        self, peer_id: str, resp: AppendEntriesResponse
+    ) -> int:
+        """Where to resume replicating to a follower that rejected us (§5.3).
+
+        Three rules, and the third is the one that matters:
+          * no hint (older peer, or a stale-term rejection) — walk back one, as before.
+          * we also hold the follower's conflicting term — everything up to our LAST
+            entry in that term is common ground, so resume just past it.
+          * we do not hold that term at all — the follower's whole run of it is bogus;
+            resume at the first index it reported for that term.
+
+        Then clamp, because a hint is not authority. The result can never rise or stand
+        still: a rejection that failed to move nextIndex DOWN would retry the same index
+        forever, so a hint that would do that degrades to the naive step instead of
+        hanging the repair. Termination is what the clamp buys; the jump is only speed.
+        """
+        current = self.next_index[peer_id]
+        if resp.conflict_index is None:  # nothing to go on
+            return max(1, current - 1)
+        proposed = resp.conflict_index
+        if resp.conflict_term is not None:
+            ours = self.storage.last_index_of_term(resp.conflict_term)
+            if ours is not None:
+                proposed = ours + 1
+        return max(1, min(proposed, current - 1))
 
     def _advance_commit_index(self) -> None:
         """Rule 3 (§5.4.2 / Figure 8): majorities count only for CURRENT-term

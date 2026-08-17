@@ -32,7 +32,7 @@ practices — testing and observability.
 | D12 | Docker Compose is the primary runtime; **K8s StatefulSet + kind** included | K8s-only (heavier demo path) | StatefulSet gives stable identities (`raftkv-0.raftkv-hl`) that consensus peers need | High |
 | D13 | Demo timing: heartbeat 500 ms, election timeout 1.5–3 s (config-overridable; tests use 30/100–200 ms) | Paper's 150–300 ms (invisible to humans) | Paper §5.2 requires randomized timeouts ≫ broadcast time; scaling up preserves the ratio and makes elections watchable | High |
 | D14 | Writes: client discovers leader via `/state`; non-leader returns **503 + leader_id**; dashboard auto-routes | 307 redirects (Docker-internal hostnames are unreachable from the browser, causing demo-day failures) | Clean-start reliability beats cleverness; production answer (smart client / redirects) documented | Medium |
-| D15 | Naive `nextIndex` decrement backoff | Accelerated conflictIndex/conflictTerm backtracking | Students' Guide: naive is correct, just slow on long logs — irrelevant at demo scale; named as a known optimization | High |
+| D15 | Accelerated `conflictIndex`/`conflictTerm` backtracking (§5.3) | Naive one-index `nextIndex` decrement — what this shipped as, until it was measured | "Slow only on long logs, irrelevant at demo scale" turned out to be wrong *at* demo scale: `/admin/flood` makes a 6000-entry log in six seconds, and a node reset behind one then needed ~52 min of round trips to rejoin (measured 2026-08-16, live cluster). The hint costs two optional integers and makes that two round trips | High |
 
 ## Prior art
 
