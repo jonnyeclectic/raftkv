@@ -1054,6 +1054,22 @@ function sortedKv(kv) {
 }
 /* --- end key ordering ------------------------------------------------------------- */
 
+/* --- voter count (sliced out and run under node by tests/test_dashboard_voters.py) ---
+   "N voting" on a card has to come from the CONFIGURATION, never from the transport peer
+   map. A learner dials every voter, so `peers + self` counts the learner itself and a
+   4-voter cluster renders "5 voting" on the learner's own card. That is the one mistake
+   this codebase cannot afford to display as fact -- a learner leaking into a voter set
+   is the majority-of-four data-loss bug -- and showing it to the operator is how someone
+   comes to believe it.
+
+   config.voters is the log-derived voter set, which is exactly what quorum is computed
+   over, so the card and the health strip can no longer disagree. A node in nobody's
+   configuration has an empty voter set, and "0 voting" is the honest answer there. */
+function voterCount(s) {
+  return Object.keys(s?.config?.voters ?? {}).length;
+}
+/* --- end voter count --------------------------------------------------------------- */
+
 function infraDetails(addr, s) {
   const wrap = el("div", "sub");
 
@@ -1065,7 +1081,7 @@ function infraDetails(addr, s) {
   // Per-node, because "build MIXED (2)" in the summary is a dead end without it.
   if (builds[addr]) topo.push(row("build", builds[addr].server));
   wrap.append(detailsBlock(addr, "infra",
-    `infrastructure · ${Object.keys(peers).length + 1} voting`, topo));
+    `infrastructure · ${voterCount(s)} voting`, topo));
 
   // The count comes off the raw map, so the summary is honest while collapsed; the rows
   // themselves are built lazily, only when someone is looking at them.
