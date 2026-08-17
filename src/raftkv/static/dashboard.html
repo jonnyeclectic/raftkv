@@ -185,6 +185,13 @@
     overscroll-behavior: contain;   /* stops the page scrolling once the list bottoms out */
     border-top: 1px solid var(--line);
     border-bottom: 1px solid var(--line);
+    /* Values are right-aligned, so without a gutter the scrollbar is drawn ON TOP of the
+       last column and `v199` reads as `v19` -- a wrong value, not a cosmetic clip, on the
+       one panel whose whole job is showing what the cluster stored. `scrollbar-gutter`
+       reserves the space where supported; the padding covers macOS overlay scrollbars,
+       which reserve nothing. */
+    scrollbar-gutter: stable;
+    padding-right: var(--s2);
   }
   .kvscroll::-webkit-scrollbar { width: 8px; }
   .kvscroll::-webkit-scrollbar-thumb { background: var(--line-hi); border-radius: 4px; }
@@ -440,12 +447,29 @@ let NODES = (params.get("nodes")
   || "127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003").split(",")
   .filter(a => ADDR_SHAPE.test(a));
 
-/* Addresses to probe for nodes that exist but are in nobody's configuration. Nothing
-   in /state can reveal them -- that is what "not a member" means -- so the only way to
-   see one is to knock. Probed rather than seeded into NODES: an address that has never
-   answered cannot be classified, and a 3-node deployment showing two permanent
-   unreachable cards is worse than not knowing. An explicit ?nodes= turns this off. */
-const PROBE = params.get("nodes") ? [] : ["127.0.0.1:8004", "127.0.0.1:8005"];
+/* --- probe list (behaviour pinned by tests/test_dashboard_probe.py) ----------------
+   Addresses to knock on, looking for nodes that exist but are in nobody's
+   configuration. Nothing in /state can reveal one -- that is what "not a member" means
+   -- so knocking is the only way to see it. Probed rather than seeded into NODES: an
+   address that has never answered cannot be classified, and a 3-node deployment showing
+   two permanent unreachable cards is worse than not knowing.
+
+   The default is the two idle nodes run_local.sh and compose always start. `?probe=`
+   extends it for a node provisioned mid-demo (`make node-up N=6` prints the URL), and
+   the list is deliberately NOT open-ended: every address here is fetched twice a second
+   forever, so an unused slot is a console full of ERR_CONNECTION_REFUSED for the rest
+   of the session. A bare number means 127.0.0.1; anything that is not host:port is
+   dropped rather than fetched. An explicit ?nodes= turns probing off entirely. */
+function probeList(params) {
+  if (params.get("nodes")) return [];
+  return (params.get("probe") || "8004,8005")
+    .split(",")
+    .map(s => s.trim())
+    .map(s => /^\d+$/.test(s) ? `127.0.0.1:${s}` : s)
+    .filter(a => /^[A-Za-z0-9.-]+:\d+$/.test(a));
+}
+/* --- end probe list ---------------------------------------------------------------- */
+const PROBE = probeList(params);
 
 const states = {};        // addr -> NodeState | null
 const OPEN_DETAILS = new Set();   // <details> is rebuilt every tick; keep open state outside the DOM
@@ -507,20 +531,64 @@ function renderBuild() {
   slot.style.color = stale ? "var(--candidate)" : "";
 }
 
+/* --- membership adoption (behaviour pinned by tests/test_dashboard_adopt.py) --------
+   Members are self-announcing, so they should never need probing: the configuration is
+   a replicated log entry carrying id -> ADVERTISE address for every voter and learner,
+   and every node that has it will hand it over in /state.
+
+   This is what makes a reload safe. NODES is rebuilt from the query string on load, so
+   without this an attached node-6 -- and node-4 the moment it was promoted -- silently
+   vanishes from a page refresh mid-session, having been added to NODES at runtime by
+   attach(). Probing cannot cover them either: PROBE is a fixed short list, because
+   every address on it is fetched twice a second for the session.
+
+   The host guard is the whole safety argument. `advertise_addr` is what PEERS dial,
+   which on compose is `raft-node-4:8000` -- a name that resolves inside the container
+   network and nowhere near this browser. Adopting one would add a permanently
+   unreachable card that looks like a crashed node. Same host as an address already
+   being polled means the browser has already proven it can reach that host. */
+function adoptableAddrs(states, nodes) {
+  const hosts = new Set(nodes.map(a => a.split(":")[0]));
+  const found = [];
+  for (const s of Object.values(states)) {
+    if (!s) continue;
+    const cfg = s.config ?? {};
+    for (const addr of Object.values({...cfg.voters, ...cfg.old_voters, ...cfg.learners})) {
+      if (!addr || nodes.includes(addr) || found.includes(addr)) continue;
+      if (!/^[A-Za-z0-9.-]+:\d+$/.test(addr)) continue;
+      if (!hosts.has(addr.split(":")[0])) continue;
+      found.push(addr);
+    }
+  }
+  return found;
+}
+/* --- end membership adoption ------------------------------------------------------- */
+
 // Knock on the staging addresses; adopt whoever answers. Runs every tick, so a node
 // started after the tab was opened shows up, and once adopted it STAYS in NODES --
 // by then it has been seen, so a later silence is a crash worth rendering, not an
 // address that might be nothing.
+//
+// Probing is only for nodes in NOBODY's configuration -- the one case no /state can
+// reveal. Anything already in a configuration arrives through adoptableAddrs() for
+// free, and reading last tick's `states` is soon enough: it costs one tick, no request.
+/* --- discovery (behaviour pinned by tests/test_dashboard_discover.py) --------------- */
 async function discover() {
-  await Promise.all(PROBE.map(async addr => {
-    if (NODES.includes(addr)) return;
+  for (const addr of adoptableAddrs(states, NODES)) NODES.push(addr);
+  // Probed in parallel but appended in PROBE order, not completion order. Pushing from
+  // inside the callback made the staged row a race: node-5's card drew before node-4's
+  // whenever 8005 answered first, so the order changed between page loads for no visible
+  // reason. NODES order is card order (memberAddrs/stagedAddrs filter it).
+  const answered = await Promise.all(PROBE.map(async addr => {
+    if (NODES.includes(addr)) return null;
     try {
-      if ((await fetch(`http://${addr}/state`, {signal: AbortSignal.timeout(700)})).ok) {
-        NODES.push(addr);
-      }
-    } catch { /* nothing there; ask again next tick */ }
+      const r = await fetch(`http://${addr}/state`, {signal: AbortSignal.timeout(700)});
+      return r.ok ? addr : null;
+    } catch { return null; /* nothing there; ask again next tick */ }
   }));
+  for (const addr of answered) if (addr && !NODES.includes(addr)) NODES.push(addr);
 }
+/* --- end discovery ----------------------------------------------------------------- */
 
 /* --- node classification (behaviour pinned by tests/test_dashboard_staged.py) -------
    Member or staged, decided by the node's OWN log rather than by a UI convention: the

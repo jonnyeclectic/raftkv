@@ -179,6 +179,11 @@ def test_dashboard_caps_the_state_machine_list_instead_of_growing_the_card(clien
     page = client.get("/").text
     assert ".kvscroll" in page and "max-height" in page
     assert "overflow-y: auto" in page
+    # Values are right-aligned, so the scrollbar is drawn over the last column unless a
+    # gutter is reserved: `v199` rendered as `v19` -- a wrong value on the one panel whose
+    # job is showing what the cluster stored. Seen in a screenshot, not in a test.
+    assert "scrollbar-gutter: stable" in page
+    assert "padding-right" in page.split(".kvscroll {")[1].split("}")[0]
     # the position has to outlive the 500ms rebuild or the list cannot be read at all
     assert "SCROLL_POS" in page and "function restoreScroll(" in page
     assert "data-scrollkey" in page or "scrollkey" in page
