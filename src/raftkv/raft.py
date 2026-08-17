@@ -554,10 +554,43 @@ class RaftNode:
                 proposed = ours + 1
         return max(1, min(proposed, current - 1))
 
+    def _commit_candidates(self) -> list[int]:
+        """The only indices worth testing for agreement, highest first.
+
+        `acked` is `{p : match_index[p] >= candidate}`, which is a STEP function of
+        candidate: it changes only where some peer's matchIndex sits. So across the
+        half-open interval `(m_k, m_k+1]` the answer to "does a majority have this?" is
+        the same at every index, and the highest index in that interval — the one we
+        actually want — is `m_k+1`, a matchIndex value. Testing every index in between
+        asks an identical question thousands of times and pays one SQLite `term_at()`
+        for each ask.
+
+        The cost was real and worth removing. The old scan ran once per `submit()` and
+        spanned `last_log_index - commit_index`, so while a burst of N was in flight it was
+        O(N) per call and O(N²) for the burst: instrumented, 200 concurrent writes issued
+        20,315 `term_at()` calls against 203 appends, all of them synchronous on the event
+        loop that also owes every follower a heartbeat.
+
+        It is NOT the cause of the concurrency cliff, and an earlier revision of the docs
+        saying so was wrong. Profiling after the fix put 800 commits at 0.18 s with the loop
+        sitting idle in kqueue — the failure tracks in-flight requests, not log work. Do not
+        reinstate that explanation here; see FAILURE_MODES.md § "The throughput ceiling,
+        measured".
+
+        `last_log_index()` is included because in a single-node cluster no peer has a
+        matchIndex at all and `{self}` is already a majority — without it a lone voter
+        could never commit anything.
+        """
+        last = self.storage.last_log_index()
+        steps = {m for m in self.match_index.values() if m > self.commit_index}
+        if last > self.commit_index:
+            steps.add(last)
+        return sorted(steps, reverse=True)
+
     def _advance_commit_index(self) -> None:
         """Rule 3 (§5.4.2 / Figure 8): majorities count only for CURRENT-term
         entries; older entries commit transitively when a newer one commits."""
-        for candidate_index in range(self.storage.last_log_index(), self.commit_index, -1):
+        for candidate_index in self._commit_candidates():
             if self.storage.term_at(candidate_index) != self.current_term:
                 break  # terms only shrink going backwards; nothing below qualifies
             # Who has it: us (we appended it) plus every peer whose matchIndex reaches
