@@ -13,11 +13,11 @@ node-1 as leader, one card per node giving term, leader, voted-for and log/commi
 indices, and per-node kill, cut-links and reset controls beside a panel for writing keys,
 provisioning and attaching nodes, and healing partitions.](Dashboard.png)
 
-The opening state of the demo: three nodes, one leader, quorum `2 of 3 voting`. Every card
-and the topology graph poll `GET /state` on each node every 500 ms, so a node that dies
-goes red on its own rather than because something told the page to redraw — which is why
-killing a node in front of an audience looks like the cluster reacting instead of a
-screen refreshing.
+A three-node cluster at rest: one leader, quorum `2 of 3 voting`. Every card and the
+topology graph poll `GET /state` on each node every 500 ms, so a node that dies goes red
+on its own — the page reports what it independently observed, rather than redrawing
+because something told it to. That is what makes the failure controls legible: the change
+you see is the cluster reacting, not the UI.
 
 ## Quickstart
 
@@ -342,5 +342,5 @@ runtime-only; a restart restores the env-derived config.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — modules, concurrency model, SQLite schema, component + deployment diagrams
 - [docs/RAFT.md](docs/RAFT.md) — plain-language Raft walkthrough with sequence diagrams
 - [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md) — handled failures and deliberate omissions, as tables
-- [docs/OVERVIEW.md](docs/OVERVIEW.md) — how this addresses the assignment; decision log with evidence
+- [docs/OVERVIEW.md](docs/OVERVIEW.md) — what the project sets out to do; decision log with evidence
 - [docs/CI.md](docs/CI.md) — what each CI job gates, and why exactly one status check is required
