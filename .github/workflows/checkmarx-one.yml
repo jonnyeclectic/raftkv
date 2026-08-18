@@ -1,0 +1,70 @@
+# Checkmarx One: SAST, SCA and IaC scanning, uploaded to GitHub as SARIF so findings
+# land in the Security tab beside CodeQL's rather than in a log nobody opens.
+#
+# This is a THIRD-PARTY action, not one certified by GitHub, and it needs a Checkmarx One
+# tenant. Until `CX_TENANT`, `CX_CLIENT_ID` and `CX_CLIENT_SECRET` exist as repository
+# secrets the scan step skips itself rather than failing: an unconfigured optional scanner
+# that reds every pull request teaches people to ignore a red check, which costs more than
+# the scanner was ever going to catch. Set the three secrets and it starts working with no
+# further edit here.
+#
+# It is deliberately NOT part of the `gate` aggregation in ci.yml. `gate` is the required
+# check and every job it names must be able to pass on a fork, from a clean clone, with no
+# account anywhere. This one cannot.
+
+name: Checkmarx Scan
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: ["main"]
+
+# Starts at nothing and is widened per job, which tests/test_ci_gate.py asserts for every
+# workflow in this directory.
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read          # actions/checkout
+      security-events: write  # upload-sarif writes into the Security tab
+      actions: read           # upload-sarif needs it on a private repository
+    # `secrets` is not available in a step-level `if`, but it IS available in a job-level
+    # `env`, so the presence check happens once here and the steps read the result.
+    env:
+      CX_CONFIGURED: ${{ secrets.CX_TENANT != '' && secrets.CX_CLIENT_ID != '' && secrets.CX_CLIENT_SECRET != '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The default leaves a usable GITHUB_TOKEN in .git/config for the whole job,
+          # where any later step — including a third-party container — can read it.
+          persist-credentials: false
+
+      - name: Checkmarx One scan
+        if: env.CX_CONFIGURED == 'true'
+        # The stock GitHub template pins 8e887bb, which is a dependabot merge commit from
+        # September 2022 and carries no tag at all. 2.3.40 is the current release.
+        uses: checkmarx/ast-github-action@b21af721f0f841c9c10f8f87767f4d8df2d13db0 # 2.3.40
+        with:
+          base_uri: https://ast.checkmarx.net
+          cx_client_id: ${{ secrets.CX_CLIENT_ID }}
+          cx_client_secret: ${{ secrets.CX_CLIENT_SECRET }}
+          cx_tenant: ${{ secrets.CX_TENANT }}
+          additional_params: --report-format sarif --output-path .
+
+      - name: Upload SARIF file
+        # Guarded on the file, not only on the scan: the scan can run and still produce
+        # nothing to upload, and upload-sarif fails on a missing path.
+        if: env.CX_CONFIGURED == 'true' && hashFiles('cx_result.sarif') != ''
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: cx_result.sarif
+
+      - name: Say why this was a no-op
+        if: env.CX_CONFIGURED != 'true'
+        run: |
+          echo "::notice::Checkmarx secrets are not configured, so no scan ran." \
+               "Set CX_TENANT, CX_CLIENT_ID and CX_CLIENT_SECRET to enable it."
