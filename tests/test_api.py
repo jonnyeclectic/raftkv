@@ -249,7 +249,7 @@ def test_dashboard_javascript_parses(client):
     node_bin = shutil.which("node")
     if node_bin is None:
         pytest.skip("node not available to parse the inline script")
-    script = re.search(r"<script>(.*)</script>", client.get("/").text, re.S)
+    script = re.search(r"<script\b[^>]*>(.*?)</script\b[^>]*>", client.get("/").text, re.S | re.I)
     assert script, "dashboard has no inline script"
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
         fh.write(script.group(1))
