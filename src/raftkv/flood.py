@@ -109,10 +109,28 @@ class FloodRunner:
         }
 
     # ---- introspection -----------------------------------------------------
+    def _busy(self) -> bool:
+        """The one answer to "is a flood in flight", for the guard and the status alike.
+
+        These used to disagree, and the disagreement was reachable. `start()` asked the
+        task; `status()` read the flag; and `_run`'s `finally` clears the flag before the
+        coroutine returns and the task is marked done. Inside that window the dashboard
+        drew an idle generator while POST /admin/flood answered 409 -- the same object
+        telling an operator "nothing is running" and "already running" in one breath.
+
+        Neither source is sufficient alone. The flag misses a task that has cleared it but
+        not finished unwinding; the task is a weaker statement than the flag, because
+        cancellation lands asynchronously. Treating either as busy is the conservative
+        reading, and the only one under which the two endpoints cannot contradict."""
+        if self._state["running"]:
+            return True
+        return self._task is not None and not self._task.done()
+
     def status(self) -> dict:
         """A snapshot the dashboard can poll. Includes a live elapsed_ms while running,
         so a stalled flood is visibly stalled instead of merely quiet."""
         state = dict(self._state)
+        state["running"] = self._busy()
         if state["running"] and state["started_at"] is not None:
             state["elapsed_ms"] = round((time.monotonic() - state["started_at"]) * 1000)
         return state
@@ -123,7 +141,7 @@ class FloodRunner:
 
         Leader-only, and checked here rather than inside the loop: a flood aimed at a
         follower would produce N identical NotLeaderErrors and teach nothing."""
-        if self._task is not None and not self._task.done():
+        if self._busy():
             raise FloodBusyError("a flood is already running on this node")
         if self._node.role.value != "leader":
             raise NotLeaderError(self._node.leader_id)

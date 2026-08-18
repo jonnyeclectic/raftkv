@@ -221,6 +221,41 @@ async def test_the_runner_refuses_to_overlap_itself(make_node):
         await node.stop()
 
 
+async def test_the_status_and_the_guard_never_disagree_about_running(make_node):
+    """The two answers to "is a flood running" have to be the same answer.
+
+    `_run`'s `finally` clears the flag, and only then does the coroutine return and the
+    task become done. A guard reading the task and a status reading the flag therefore
+    disagree for the width of that gap: the dashboard polls `running: false` and draws an
+    idle generator, while the POST it enables comes back 409 "already running". Rare, and
+    unfalsifiable from the outside -- an operator sees a button that does nothing.
+
+    The gap is reconstructed here rather than raced for, because racing it is exactly what
+    makes it a bug worth pinning: it is too narrow to hit on demand and too real to leave.
+    """
+    node = make_node(peer_ids=())
+    await node._start_election()
+    runner = FloodRunner(node)
+
+    cleared = asyncio.Event()
+
+    async def finishing():
+        runner._state["running"] = False   # what _run's finally does...
+        cleared.set()
+        await asyncio.sleep(0.05)          # ...well before the task is marked done
+
+    runner._task = asyncio.create_task(finishing())
+    await cleared.wait()
+
+    assert runner._task.done() is False, "the window under test did not open"
+    assert runner.status()["running"] is True, "status called an unfinished flood idle"
+    with pytest.raises(FloodBusyError):
+        runner.start("distinct", total=1, concurrency=1)
+
+    await runner._task
+    assert runner.status()["running"] is False, "a finished flood must read as finished"
+
+
 async def test_bounds_are_enforced_in_the_runner_not_only_in_the_schema(make_node):
     """Defence in depth, and it matters: the module is importable, so the schema is not
     the only caller. A ValueError here is what app.py maps to 422."""

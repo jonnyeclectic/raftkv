@@ -72,6 +72,11 @@ jobs:
           git diff --exit-code -- requirements.lock
 
       - name: pytest
+        # The same scaled clock ci.yml uses, for the same reason: this runs on the same
+        # hosted hardware, so the same spurious elections are available to it. A release
+        # is the worst place to discover that, because the tag is already cut by then.
+        env:
+          RAFT_TEST_TIMING_SCALE: "4"
         run: uv run pytest -o addopts="" -rs
 
   publish:
