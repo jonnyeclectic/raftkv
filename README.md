@@ -344,3 +344,4 @@ runtime-only; a restart restores the env-derived config.
 - [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md) — handled failures and deliberate omissions, as tables
 - [docs/OVERVIEW.md](docs/OVERVIEW.md) — how this addresses the assignment; decision log with evidence
 - [docs/CI.md](docs/CI.md) — what each CI job gates, and why exactly one status check is required
+- [docs/DEMO_RUNBOOK.md](docs/DEMO_RUNBOOK.md) — the presentation script: what to press, in what order, and the line to say while it is on screen
