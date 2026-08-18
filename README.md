@@ -172,6 +172,159 @@ Per-node builds are under each card's **infrastructure** section.
 - `make k8s-scale N=5` — provision more pods. They come up **staged**: a replica is a process, not a member, so attach and promote them from the dashboard to actually grow the cluster
 - `make k8s-down` — delete the kind cluster
 
+## Running locally
+
+`make demo` runs the three nodes as containers. `make run-local` runs them as plain
+processes instead — nodes **2 and 3 only**, so node-1 can be started from an IDE debugger.
+Nothing above node-3 starts by itself: the staged row is empty until the dashboard's
+**provision node** button (or `make node-up N=4`) creates one.
+
+The compose targets (`make demo`, `make smoke`, `make clean-start-check`) need Docker; the
+`k8s-*` targets need kind and kubectl. `make run-local` needs only the Python environment
+from `make install`.
+
+### Before starting anything
+
+`make demo` and `make run-local` both bind 8001–8003, and `make node-up` extends upward
+from 8004. Two clusters answering to the same node IDs leaves the dashboard showing a mix
+of them, and `localhost` resolving to `::1` rather than `127.0.0.1` picks between them.
+So stop whatever is running (`make down`, `make demo-reset`) and confirm the ports are
+genuinely free:
+
+```bash
+lsof -nP -i :8001-8006 -sTCP:LISTEN     # should print nothing
+```
+
+### The clean-start check
+
+`make clean-start-check` is the compose path proving it works on a machine that has never
+seen this project: it rebuilds `--no-cache` from clean, smokes, and tears down.
+
+- **Stop any `run-local` / debugger nodes first.** The check refuses (after its own `down`)
+  while anything else holds 8001–8003, because a local node's specific `127.0.0.1` bind
+  wins over compose's wildcard forward and the smoke test would otherwise exercise the
+  wrong cluster — the symptom is a false `no failover leader`.
+- **Run it with the machine otherwise idle.** The full test suite starving the 4-CPU colima
+  VM mid-smoke produces that same failure honestly.
+
+### Starting the local cluster
+
+```bash
+make demo-reset      # DESTRUCTIVE: kills local nodes, deletes data/ and logs/
+make run-local       # nodes 2 and 3 only — nothing above node-3 starts by itself
+```
+
+`demo-reset` deletes every database and log, which is the point: a half-grown 5-voter
+cluster left over from an earlier run is otherwise the state you start in.
+
+Then start node-1 yourself from the IDE:
+
+```
+script: scripts/debug_node.py        <- a SCRIPT target, not `module: uvicorn`
+env:    RAFT_NODE_ID=node-1 RAFT_DB_PATH=data/node-1.db RAFT_LOG_DIR=logs
+        RAFT_PEERS=node-2=127.0.0.1:8002,node-3=127.0.0.1:8003
+        RAFT_ADVERTISE=127.0.0.1:8001
+        RAFT_PORT=8001
+working directory: the repo root
+```
+
+Open **http://127.0.0.1:8002/** — node-2's copy of the dashboard. Serve it from a node you
+are *not* debugging: node-1's page stops updating the moment you sit on a breakpoint.
+
+Four things in that configuration are load-bearing, and each has already cost time here:
+
+- **A `script:` target, not `module: uvicorn`.** PyCharm/IntelliJ 2024.3 resolves module
+  targets through `pkgutil.get_loader()`, which Python 3.14 removed; pydevd swallows the
+  error and reports the misleading `No module named uvicorn`. It *runs* fine and only fails
+  to *debug*, which is what makes it confusing. `scripts/debug_node.py` explains the
+  mechanism.
+- **`127.0.0.1`, never `localhost`.** localhost resolves to 127.0.0.1 *or* `::1`. A compose
+  cluster publishes on both while a local node binds only the first, so the same string can
+  reach two different clusters. This is why the dashboard polls the literal address.
+- **`RAFT_ADVERTISE`, even on a bootstrap node.** A node writes its own address into the
+  configuration entry, that entry replicates, and an empty one leaves a later-joined member
+  holding a voter it can never dial. The failure surfaces several steps later, when the
+  cluster grows.
+- **The timing asymmetry lives in `run_local.sh`, not in this configuration.** Node-1 runs
+  default timings; `run_local.sh` starts nodes 2 and 3 with `RAFT_ELECTION_MIN=4
+  RAFT_ELECTION_MAX=6`. That is what makes node-1 the leader *deterministically* — its
+  1.5–3 s timeout always fires before the peers' 4–6 s — and it is what makes a breakpoint
+  pause under ~4 s cost nothing. Do not stretch node-1's own timers instead: an earlier cut
+  did (60–120 s on node-1 only), under which node-1 could never win an election — its timer
+  never fired first — nor hold leadership, since its 5 s heartbeat outlasted the peers' 3 s
+  timeout.
+
+> **Restart node-1 after any Python change.** `GET /` re-reads `dashboard.html` from disk on
+> every request, so UI edits show up on a browser reload — but `app.py`, `raft.py` and
+> `models.py` are imported once at process start. The failure mode is quiet: the dashboard
+> grows a new button while the server still 404s the endpoint behind it. The masthead's
+> `ui`/`srv` stamps exist to catch it — `srv` is frozen at import, so a stale process shows
+> a stale hash.
+
+### Adding a node from a terminal
+
+```bash
+make node-up N=6      # node-6 on 127.0.0.1:8006, staged
+```
+
+It prints the two ways to bring it in:
+
+- **Attach it directly** — type `127.0.0.1:8006` into **attach by address** in the CONTROL
+  panel. One step, and it lands in the cluster as a learner.
+- **Or see it in the staged row first** — reopen the dashboard at
+  `http://127.0.0.1:8002/?probe=8004,8005,8006` (the script prints this URL) and attach it
+  from its own card. `?probe=` **replaces** the default list rather than adding to it, so
+  keep 8004 and 8005 in it or those two stop being watched. The default is short on
+  purpose: every address on it is a fetch twice a second for the whole session.
+
+Only *staged* nodes need probing at all. Once a node is in the configuration the page adopts
+it automatically — the configuration is a replicated log entry carrying each member's
+address, so any node hands it over in `/state`. That is what makes a page reload safe: a
+promoted node-4, or a node-6 attached by address, comes back without the query string.
+
+Either way it arrives *non-voting*, and **promote to voter** is a separate step. Scaling
+back down is not implemented: removing a voter is another configuration change, and it has
+to leave the configuration before its process leaves, or the quorum it was counted in
+shrinks under a cluster that has not agreed to shrink.
+
+### Getting back to a known state
+
+- **reset all nodes** in the dashboard returns a grown cluster to its original size without
+  leaving the browser. A **per-node** reset deliberately does not revert membership: doing
+  so would hand the wiped node the voter set its process booted with — after growing to
+  five, a subset of the real one, and therefore a second quorum
+  ([docs/FAILURE_MODES.md](docs/FAILURE_MODES.md) table 1c).
+- `make demo-reset && make run-local` is the harder reset: every database and log deleted,
+  cluster back to three.
+- `make down` stops the compose cluster and deletes its volumes.
+
+### Moving leadership around
+
+Two runtime-only controls, for when you want a specific node's follower paths (the
+consistency check in `handle_append_entries`, the vote rules in `handle_request_vote`)
+rather than its leader paths:
+
+```bash
+curl -sX POST 127.0.0.1:8002/admin/campaign      # node-2 takes the term, immediately
+curl -sX POST 127.0.0.1:8001/admin/timing -H 'content-type: application/json' \
+     -d '{"election_timeout_min": 60, "election_timeout_max": 120}'      # park node-1
+```
+
+Node-2 now leads — its heartbeats hit node-1's follower paths twice a second — and the
+parked timeout means a resumed node-1 does not campaign over a pause it slept through.
+Swapping back is symmetric, and works *while parked*, because campaign does not wait for a
+timer:
+
+```bash
+curl -sX POST 127.0.0.1:8001/admin/campaign      # node-1 takes the term back
+curl -sX POST 127.0.0.1:8001/admin/timing -H 'content-type: application/json' \
+     -d '{"election_timeout_min": 1.5, "election_timeout_max": 3.0}'     # unpark
+```
+
+A timing update is validated whole against the startup ratio rules (§5.2), so a typo cannot
+configure the cluster that elects around its own leader forever. Both knobs are
+runtime-only; a restart restores the env-derived config.
+
 ## Docs
 
 - [docs/CODE_TOUR.md](docs/CODE_TOUR.md) — where to start reading, the five call paths, and where to put a breakpoint

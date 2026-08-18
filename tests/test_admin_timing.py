@@ -15,7 +15,7 @@ safe to expose to an operator against a running cluster:
     only waste a term it cannot win.
 
 Neither control is persisted. A restart restores the env-derived config, which is what
-a demo reset wants.
+a reset wants.
 """
 
 import pytest
