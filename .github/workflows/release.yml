@@ -54,7 +54,15 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: ''
+          # `package-manager-cache`, NOT `cache`. They are different inputs and only one
+          # of them is on by default. Read the two descriptions at the pinned SHA above:
+          #   cache                 — "specify a package manager for caching"; no default,
+          #                           so `''` is indistinguishable from omitting it
+          #   package-manager-cache — "set to false to disable automatic caching";
+          #                           `default: true`
+          # So `cache: ''` reads as a disable and is a no-op — the automatic cache it was
+          # meant to switch off is the one this line actually controls.
+          package-manager-cache: false
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
