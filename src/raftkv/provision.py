@@ -244,14 +244,15 @@ async def spawn(
     elif await _port_is_bound(PORT_BASE + ordinal):
         raise ProvisionError(f"port {PORT_BASE + ordinal} is already in use.")
 
-    port = PORT_BASE + ordinal
-    node_id = f"node-{ordinal}"
+    safe_ordinal = int(ordinal)
+    port = PORT_BASE + safe_ordinal
+    node_id = f"node-{safe_ordinal}"
     addr = f"127.0.0.1:{port}"
 
     pathlib.Path("data").mkdir(exist_ok=True)
     log_root = pathlib.Path(log_dir).resolve()
     log_root.mkdir(parents=True, exist_ok=True)
-    stdout = (log_root / f"{node_id}.stdout").resolve()
+    stdout = (log_root / f"node-{safe_ordinal}.stdout").resolve()
     try:
         stdout.relative_to(log_root)
     except ValueError as exc:
