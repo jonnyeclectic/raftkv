@@ -8,6 +8,17 @@ partition/failover/divergence tests), and how those failures are mitigated (quor
 commit, persistence-before-reply, conflict-only log repair) — with every design decision
 recorded with evidence in [docs/OVERVIEW.md](docs/OVERVIEW.md).
 
+![The raftkv dashboard showing a three-node cluster at term 1: a topology graph with
+node-1 as leader, one card per node giving term, leader, voted-for and log/commit/applied
+indices, and per-node kill, cut-links and reset controls beside a panel for writing keys,
+provisioning and attaching nodes, and healing partitions.](Dashboard.png)
+
+The opening state of the demo: three nodes, one leader, quorum `2 of 3 voting`. Every card
+and the topology graph poll `GET /state` on each node every 500 ms, so a node that dies
+goes red on its own rather than because something told the page to redraw — which is why
+killing a node in front of an audience looks like the cluster reacting instead of a
+screen refreshing.
+
 ## Quickstart
 
 ```bash
@@ -114,7 +125,7 @@ Per-node builds are under each card's **infrastructure** section.
 | `tests/test_admin_timing.py` | The tempo controls: a live timing update is revalidated as a whole config (the §5.2 ratios hold mid-flight) and reaches the running timer without a restart; `campaign` elects exactly the node asked, refuses a sitting leader, and never moves a learner |
 | `tests/test_chaos_soak.py` | Randomized message schedules against the safety properties: a seeded hostile network, faults drawn rather than scripted, and a reproducible seed on any failure |
 | `tests/test_ci_gate.py` | The gating policy tested like the rest of the system: one un-skippable required check, and every job in `ci.yml` reachable from its `needs` |
-| `tests/test_docs_matrix.py` | These tables, in both directions: every test file has a row, every row names a file that exists, every doc is linked — plus every `tests/…::test_name` cited anywhere in the shipped prose, down to the test name |
+| `tests/test_docs_matrix.py` | These tables, in both directions: every test file has a row, every row names a file that exists, every doc is linked — plus every `tests/…::test_name` cited anywhere in the shipped prose, down to the test name, and every embedded image resolving to a file that is actually here |
 | `scripts/smoke.sh` | End-to-end check against a running compose cluster |
 | `scripts/clean_start_check.sh` | THE clean-start gate: the compose path works from absolutely clean state |
 | `scripts/run_local.sh` | Starts nodes 2–3 locally so node-1 can run under the IDE debugger. Nothing above node-3: the staged row starts empty and the dashboard provisions into it |
