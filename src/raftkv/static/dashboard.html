@@ -219,6 +219,22 @@
   button.primary:hover { background: #79b8ff; }
   button.danger { color: #ffb4ae; border-color: #6e2b28; }
   button.danger:hover { background: #3d1d1b; border-color: var(--down); }
+  button.ghost { background: transparent; border-color: var(--line); color: var(--ink-mid); box-shadow: none; }
+  button.ghost:hover { color: var(--ink); border-color: var(--line-hi); }
+  /* One row per operation: a title, a sentence saying what it does to the cluster, and
+     the button that does it. The flat list this replaced put five unlabelled buttons in
+     a column, which reads as a toolbar -- fine when you already know what `reset` reverts
+     and actively misleading when you do not. Each of these is destructive to somebody's
+     mental model, so each states its blast radius next to the control. */
+  .ops { display: flex; flex-direction: column; }
+  .op { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3) var(--s4); }
+  .op + .op { border-top: 1px solid var(--line); }
+  .op-h { display: flex; align-items: flex-start; gap: var(--s3); }
+  .op-t { flex: 1 1 auto; min-width: 0; }
+  .op-t b { display: block; font-size: var(--t3); font-weight: 600; color: var(--ink); }
+  .op-t span { display: block; font-size: var(--t2); line-height: 1.5; color: var(--ink-dim); margin-top: 2px; }
+  .op-a { flex: 0 0 auto; }
+  .row { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
   button.cut { color: #ffc59a; border-color: #6b3a17; }
   button.cut:hover { background: #3a2312; border-color: var(--cut); }
   :focus-visible { outline: 2px solid var(--follower); outline-offset: 2px; }
@@ -351,35 +367,61 @@
 
     <section class="panel">
       <header><span class="label">control</span></header>
-      <div class="body">
-        <!-- Deliberately not a form element: a submit event navigates the page away
-             unless every handler cooperates, and this page shares its DOM with
-             whatever extensions the browser has installed. -->
-        <div class="ctl">
-          <input id="key" placeholder="key" autocomplete="off">
-          <input id="value" placeholder="value" autocomplete="off">
+      <!-- Deliberately not a form element: a submit event navigates the page away
+           unless every handler cooperates, and this page shares its DOM with
+           whatever extensions the browser has installed. -->
+      <div class="ops">
+        <div class="op">
+          <div class="op-h">
+            <div class="op-t">
+              <b>Set a key</b>
+              <span>Goes to the leader. A follower answers 503 with the leader's id.</span>
+            </div>
+          </div>
+          <div class="row">
+            <input id="key" placeholder="key" autocomplete="off">
+            <input id="value" placeholder="value" autocomplete="off">
+          </div>
+          <div class="row">
+            <button id="setbtn" type="button" class="primary">set on leader</button>
+            <button id="delbtn" type="button" class="ghost">delete</button>
+          </div>
         </div>
-        <div class="ctl">
-          <button id="setbtn" type="button" class="primary">set on leader</button>
-          <button id="delbtn" type="button">delete</button>
-        </div>
+
         <!-- Growing the cluster is TWO steps, and this is the first one. It starts a
              process; the process joins nothing. The staged row is what step one looks
              like, and `attach as learner` on its card is step two. -->
-        <div class="ctl">
-          <button id="provbtn" type="button">provision node</button>
-          <span class="label">starts a process · in no cluster until attached</span>
+        <div class="op">
+          <div class="op-h">
+            <div class="op-t">
+              <b>Provision a node</b>
+              <span>Starts a process. It joins nothing until attached to the cluster.</span>
+            </div>
+            <div class="op-a"><button id="provbtn" type="button" class="primary">provision</button></div>
+          </div>
         </div>
-        <div class="ctl">
-          <button id="healbtn" type="button">heal all links</button>
-          <button id="resetbtn" type="button" class="danger">reset all nodes</button>
+
+        <div class="op">
+          <div class="op-h">
+            <div class="op-t">
+              <b>Heal all links</b>
+              <span>Clears every partition, in both directions.</span>
+            </div>
+            <div class="op-a"><button id="healbtn" type="button" class="ghost">heal</button></div>
+          </div>
         </div>
-        <div class="ctl">
-          <span class="label">learners do not move quorum · per-node reset keeps
-            membership · reset all reverts it</span>
+
+        <div class="op">
+          <div class="op-h">
+            <div class="op-t">
+              <b>Reset all nodes</b>
+              <span>Reverts the cluster to its bootstrap configuration. A per-node reset keeps membership, and learners never move quorum.</span>
+            </div>
+            <div class="op-a"><button id="resetbtn" type="button" class="danger">reset</button></div>
+          </div>
         </div>
-        <div class="ctl"><span id="status"></span></div>
       </div>
+      <div class="ctl" style="padding: var(--s3) var(--s4); border-top: 1px solid var(--line);"><span id="status"></span></div>
     </section>
 
     <!-- Load generator. Runs INSIDE the leader, not in this tab: a browser cannot hold
