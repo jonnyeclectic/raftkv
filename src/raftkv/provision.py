@@ -249,13 +249,18 @@ async def spawn(
     addr = f"127.0.0.1:{port}"
 
     pathlib.Path("data").mkdir(exist_ok=True)
-    pathlib.Path(log_dir).mkdir(parents=True, exist_ok=True)
-    stdout = pathlib.Path(log_dir) / f"{node_id}.stdout"
+    log_root = pathlib.Path(log_dir).resolve()
+    log_root.mkdir(parents=True, exist_ok=True)
+    stdout = (log_root / f"{node_id}.stdout").resolve()
+    try:
+        stdout.relative_to(log_root)
+    except ValueError as exc:
+        raise ProvisionError("resolved log path escapes configured log_dir") from exc
 
     with stdout.open("ab") as sink:
         child = await asyncio.create_subprocess_exec(
             *_argv(port),
-            env=_child_env(node_id, addr, log_dir),
+            env=_child_env(node_id, addr, str(log_root)),
             stdout=sink,
             stderr=asyncio.subprocess.STDOUT,
             # Its own session, so it survives whatever kills this node's shell. A staged
