@@ -189,15 +189,23 @@ def _child_env(node_id: str, addr: str, log_dir: str) -> dict[str, str]:
     return env
 
 
-async def _wait_healthy(addr: str, timeout: float = HEALTH_TIMEOUT) -> None:
+async def _wait_healthy(port: int, timeout: float = HEALTH_TIMEOUT) -> None:
     """Return once the child answers, so the endpoint never hands back an address that is
     still importing. The next thing that happens to this address is an attach, and a
     learner that 503s its first AppendEntries is a confusing way to start."""
+    if (
+        port < PORT_BASE + FIRST_ORDINAL
+        or port >= PORT_BASE + FIRST_ORDINAL + MAX_NODES
+    ):
+        raise ProvisionError(f"refusing health probe outside provision range: {port}")
+
+    addr = f"127.0.0.1:{port}"
+    health_url = httpx.URL(scheme="http", host="127.0.0.1", port=port, path="/healthz")
     deadline = asyncio.get_running_loop().time() + timeout
     async with httpx.AsyncClient(timeout=1.0) as client:
         while asyncio.get_running_loop().time() < deadline:
             try:
-                if (await client.get(f"http://{addr}/healthz")).status_code == 200:
+                if (await client.get(health_url)).status_code == 200:
                     return
             except httpx.HTTPError:
                 pass
@@ -266,7 +274,7 @@ async def spawn(
     _children[ordinal] = child
 
     try:
-        await _wait_healthy(addr)
+        await _wait_healthy(port)
     except ProvisionError:
         with contextlib.suppress(ProcessLookupError):
             child.terminate()
