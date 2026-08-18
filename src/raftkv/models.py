@@ -38,7 +38,12 @@ class Command(BaseModel):
     op: Literal["set", "delete"]
     key: str = Field(min_length=1, max_length=256)
     value: str | None = Field(default=None, max_length=4096)
-    request_id: str  # client-supplied id; detects a log index reused by a different leader
+    # Minted SERVER-side (app.py, uuid4) — the API exposes no way for a client to supply
+    # one. So it cannot deduplicate a client retry even in principle: two retries of the
+    # same logical write carry different ids by construction. Its one job is detecting a
+    # log index reused by a different leader (Students' Guide, "re-appearing index").
+    # Exactly-once would need client sessions; see FAILURE_MODES.md table 2.
+    request_id: str
 
     @model_validator(mode="after")
     def _set_requires_value(self) -> Self:
@@ -99,6 +104,12 @@ class RequestVoteRequest(BaseModel):
     candidate_id: str
     last_log_index: int
     last_log_term: int
+    # PreVote (thesis §9.6): a straw poll, not a candidacy. `term` is then the term the
+    # sender WOULD run in — one above its own — and the receiver must not treat it as an
+    # observed term, because the whole purpose is to find out whether running is worth the
+    # disruption BEFORE paying for it. Optional and defaulting to False so a peer running
+    # older code is simply asked for a real vote; see RaftNode._handle_pre_vote.
+    pre_vote: bool = False
 
 
 class RequestVoteResponse(BaseModel):
@@ -141,6 +152,13 @@ class AppendEntriesResponse(BaseModel):
 
 class Metrics(BaseModel):
     elections_started: int = 0
+    # Straw polls attempted (thesis §9.6). It exists because PreVote deliberately removes
+    # the only evidence there used to be: an isolated node used to announce that it was
+    # still trying by inflating its term, visibly, once per election timeout. Now it stays
+    # quiet — which is the point, and which would otherwise make "wedged" and "patiently
+    # failing to win" look identical from outside. The gap between this and
+    # `elections_started` IS the count of elections PreVote suppressed.
+    pre_votes_started: int = 0
     votes_granted: int = 0
     append_entries_sent: int = 0  # counts sends (incl. heartbeats), not acks
     append_entries_received: int = 0

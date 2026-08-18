@@ -49,6 +49,16 @@ Each rule is listed with the bug it prevents.
 7. **Randomized election timeouts** (§5.2) — prevents livelock where every candidate
    times out in lockstep and split votes repeat forever.
 
+**Rule 4 has exactly one exception, and it is deliberate.** A PreVote *request* carries the
+term its sender would run in — one above its own — and observing that would inflate our
+term on the strength of a question, which is the disruption PreVote exists to prevent. So
+`handle_request_vote` branches to `_handle_pre_vote` **before** `_observe_term`, and that
+handler persists nothing and resets no timer. The rule still applies in full to pre-vote
+*responses*: a reply carrying a higher term is how a node returning from a partition finds
+out it is behind, and adopting it costs nobody an election. Any change that moves the
+branch below `_observe_term` re-creates the problem; `tests/test_pre_vote.py` fails if it
+does.
+
 Beyond the seven: the election timer resets *only* on an AppendEntries from the
 current leader, on granting a vote, or on starting an election; heartbeats run the full
 receiver checks; stale replies are dropped by comparing against the term you sent; and a
@@ -84,6 +94,10 @@ sequenceDiagram
   participant N2 as node-2 (follower)
   participant N3 as node-3 (follower)
   Note over N1: election timeout fires (randomized 1.5-3s)
+  N1->>N2: PreVote(term 2) -- a straw poll, term NOT incremented
+  N1->>N3: PreVote(term 2)
+  N2-->>N1: granted (no leader heard from recently)
+  Note over N1: majority would vote yes -> now it is worth running
   N1->>N1: term++ = 2, vote for self, persist
   N1->>N2: RequestVote(term 2, lastLog 0/0)
   N1->>N3: RequestVote(term 2, lastLog 0/0)
@@ -131,3 +145,20 @@ sequenceDiagram
 
 This exact scenario runs, with assertions, in
 `tests/test_simulation.py::test_partitioned_leader_cannot_commit_then_steps_down`.
+
+The diagram shows the *safety* story, which is the one Figure 2 guarantees: S cannot
+commit, and the truncation on heal is why two leaders in different terms can never both be
+believed. What it does not show is how long S goes on calling itself the leader, and the
+answer used to be "for the whole partition" — because every mechanism that deposes a leader
+arrives in a message, and a partitioned leader receives none.
+
+CheckQuorum (thesis §6.2) makes S read its own silence instead: with no answer from a
+majority for one `election_timeout_max`, it resigns. It does not bump its term doing so —
+this is a resignation, not a campaign — and PreVote (thesis §9.6) then keeps it quiet,
+polling its unreachable peers and never getting the encouragement it needs to run. So S
+spends the partition as a follower at term 2 and disturbs nothing when it returns.
+
+That pairing is not optional. CheckQuorum alone would make S a candidate, and a candidate
+that cannot win burns a term every election timeout: after a minute it rejoins at term 25
+and that term alone deposes N2, which was leading perfectly well. See
+`tests/test_check_quorum.py` and `tests/test_pre_vote.py`.

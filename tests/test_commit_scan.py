@@ -20,7 +20,11 @@ Equivalence is the one that matters. A commit index that is one too high is an
 acknowledged write that a later leader can lose.
 """
 
+import itertools
+
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from raftkv.models import Command, LogEntry
 
@@ -197,3 +201,159 @@ def test_cost_is_flat_as_the_unacknowledged_gap_widens(make_node):
         assert committed == 100, f"log of {size} committed at {committed}, wanted 100"
         costs[size] = calls
     assert len(set(costs.values())) == 1, f"cost grew with the log: {costs}"
+
+
+# ---- the same equivalence, generated rather than chosen -----------------------
+#
+# Everything above compares the sparse scan against `exhaustive()` for term sequences a
+# person picked: all-ones, [1,1,5], a 3000-entry run. That proves equivalence for the
+# cases someone thought of, which is exactly the shape of gap this file exists to close —
+# a commit index one too high is an acknowledged write a later leader can lose, and it
+# only has to happen on one term sequence.
+#
+# The oracle was already written; only the generator was missing.
+
+_ids = itertools.count()
+
+# Function-scoped fixture + @given would normally reuse one node across examples, which is
+# what the health check is for. Each example draws a fresh node_id below and make_node keys
+# its sqlite file on that, so every example gets its own empty log. Suppressed for that
+# specific reason, not to quiet a warning.
+PROPERTY = settings(
+    max_examples=250,
+    deadline=None,  # sqlite timing varies; this asserts equivalence, never latency
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+
+
+@st.composite
+def cluster_state(draw):
+    """A leader state the implementation can actually reach.
+
+    `match_index` is bounded by the log length, and that bound is load-bearing rather than
+    tidiness. Hypothesis's first counterexample was `terms=[1]` with a peer at
+    `match_index=2`: the exhaustive walk starts at `last_log_index` so it never considers
+    index 2 and commits 1, while the sparse scan puts 2 in its candidate set, finds
+    `term_at(2)` is None, and breaks before reaching 1. A real disagreement — on a state
+    the leader cannot produce.
+
+    `match_index[peer] = prev_index + len(entries)` (raft.py), and those entries came out
+    of the leader's own log, so the value can never exceed the leader's `last_log_index`.
+    A leader also never truncates its own log, so it cannot fall behind a matchIndex it
+    already recorded. Generating past that bound tests a cluster that does not exist.
+
+    Terms come from a tiny alphabet on purpose: the interesting cases are where the same
+    term repeats and a run boundary lands near a matchIndex, not where every entry differs.
+    """
+    # SORTED, because a Raft log's terms are non-decreasing: a leader appends only its
+    # own term, and terms only ever increase. This is the second bound Hypothesis forced
+    # into the open. Given `terms=[1,2,1,2]` with current_term 2 and a peer at index 2, the
+    # exhaustive walk stops at index 3 (term 1, not current) and commits nothing, while the
+    # sparse scan skips straight from 4 to 2 and commits 2 — which Figure 2 says is
+    # correct, since index 2 holds a current-term entry a majority has. The two disagree
+    # only because the walk's early `break` assumes non-decreasing terms, which raft.py
+    # states outright: "terms only shrink going backwards; nothing below qualifies".
+    # An unsorted log is not a log this algorithm can produce.
+    terms = draw(
+        st.lists(st.integers(min_value=1, max_value=3), min_size=1, max_size=40).map(sorted)
+    )
+    last_index = len(terms)
+    matches = draw(st.tuples(st.integers(0, last_index), st.integers(0, last_index)))
+    return {
+        "terms": terms,
+        "matches": matches,
+        "current_term": draw(st.integers(1, 3)),
+        "commit_index": draw(st.integers(0, last_index)),
+    }
+
+
+def _generated_leader(make_node, state):
+    node = make_node(node_id=f"prop-{next(_ids)}", peer_ids=("node-2", "node-3"))
+    node.current_term = state["current_term"]
+    seed(node, state["terms"])
+    node.match_index = {"node-2": state["matches"][0], "node-3": state["matches"][1]}
+    node.commit_index = state["commit_index"]
+    return node
+
+
+@PROPERTY
+@given(state=cluster_state())
+def test_the_sparse_scan_always_agrees_with_the_exhaustive_walk(make_node, state):
+    """The property the whole optimisation rests on, over generated inputs."""
+    node = _generated_leader(make_node, state)
+    expected = exhaustive(node)  # pure: reads commit_index, never moves it
+    actual = commit_via_scan(node)  # mutates, so it must run second
+    assert actual == expected, (
+        f"sparse scan committed {actual}, exhaustive walk says {expected}. "
+        f"terms={state['terms']} match_index={node.match_index}"
+    )
+
+
+@PROPERTY
+@given(state=cluster_state())
+def test_the_commit_index_never_moves_backwards(make_node, state):
+    """Figure 2's monotonicity, which no hand-written case in this file states directly.
+    A commit index that retreats un-commits an entry the leader already acknowledged."""
+    node = _generated_leader(make_node, state)
+    before = node.commit_index
+    assert commit_via_scan(node) >= before
+
+
+@PROPERTY
+@given(state=cluster_state())
+def test_nothing_commits_past_the_end_of_the_log(make_node, state):
+    """The leader must never commit an index it does not itself hold, whatever the peers
+    report — the generated half of "matchIndex comes from the arguments sent"."""
+    node = _generated_leader(make_node, state)
+    assert commit_via_scan(node) <= node.storage.last_log_index()
+
+
+def test_a_match_index_beyond_the_log_is_assumed_unreachable(make_node):
+    """Pins the assumption `cluster_state()` encodes, so it is written down rather than
+    only implied by a strategy bound.
+
+    If `match_index` could ever exceed the leader's `last_log_index`, the candidate set
+    would lead with an index the log does not hold, `term_at()` would return None, and the
+    scan would break before testing any real candidate. The cluster would stop committing.
+
+    That is fail-safe rather than a lost write, which is why it has never been observed —
+    but it is also the reason `match_index` must keep coming from the arguments sent. Set
+    it from anything peer-reported and this becomes reachable.
+    """
+    node = leader(make_node)
+    seed(node, [1])
+    node.match_index = {"node-2": 0, "node-3": 2}  # impossible: 2 > last_log_index of 1
+
+    assert commit_via_scan(node) == 0, (
+        "if this now commits, the scan gained a clamp and cluster_state()'s bound can be "
+        "relaxed; if it still stalls, match_index must stay bounded by the leader's log"
+    )
+
+
+def test_the_scan_relies_on_log_terms_being_non_decreasing(make_node):
+    """The second precondition `cluster_state()` encodes, pinned in the open.
+
+    `_advance_commit_index` breaks out of its candidate loop on the first index whose term
+    is not the current one, on the reasoning raft.py states directly: "terms only shrink
+    going backwards". That holds because a leader appends only its own term and terms only
+    increase, so a valid log is non-decreasing.
+
+    Feed it a log that is not — [1, 2, 1, 2], which Raft cannot produce — and the sparse
+    scan and the exhaustive walk part company: the walk halts at index 3 and commits
+    nothing, while the sparse scan skips the intervening indices entirely and commits 2.
+    Figure 2 agrees with the SPARSE one here (index 2 holds a current-term entry a majority
+    has); it is the walk's early `break` that is wrong on an impossible input.
+
+    Recorded because it is the assumption a future change is most likely to break without
+    noticing — anything that appends an entry with a term below the log's tail.
+    """
+    node = leader(make_node)
+    node.current_term = 2
+    seed(node, [1, 2, 1, 2])  # not a reachable Raft log
+    node.match_index = {"node-2": 0, "node-3": 2}
+
+    assert commit_via_scan(node) == 2, (
+        "the sparse scan is expected to commit 2 on this impossible log; if that changed, "
+        "the candidate set or the break condition moved and cluster_state()'s sorted "
+        "bound needs revisiting"
+    )

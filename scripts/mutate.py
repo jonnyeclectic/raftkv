@@ -132,6 +132,37 @@ MUTATIONS = [
      "    elif ordinal >= FIRST_ORDINAL + max_nodes:",
      "    elif False:"),
 
+    # ---- CheckQuorum (thesis §6.2) ----
+    ("checkquorum: a leader never resigns", "raft.py",
+     "        if self._has_agreement(reachable):\n            return",
+     "        if True:\n            return"),
+    ("checkquorum: union majority, not both halves", "raft.py",
+     "        if self._has_agreement(reachable):",
+     "        if self._is_majority(self.config.voters, reachable):"),
+    ("checkquorum: contact not seeded on winning", "raft.py",
+     "        self._last_contact = {p: now for p in self._replication_targets()}",
+     "        self._last_contact = {}"),
+    ("checkquorum: only a SUCCESSFUL append counts as contact", "raft.py",
+     "        self._last_contact[peer_id] = time.monotonic()\n        self._observe_term(resp.term)",
+     "        if resp.success:\n            self._last_contact[peer_id] = time.monotonic()\n        self._observe_term(resp.term)"),
+
+    # ---- PreVote (thesis §9.6) ----
+    ("prevote: a straw poll observes the term after all", "raft.py",
+     "        if req.pre_vote:\n            return self._handle_pre_vote(req)  # BEFORE _observe_term; see there",
+     "        if False:\n            return self._handle_pre_vote(req)"),
+    ("prevote: a leader no longer holds its own lease", "raft.py",
+     "        lease_intact = self.role is Role.LEADER or (\n            self.leader_id is not None",
+     "        lease_intact = False or (\n            self.leader_id is not None"),
+    ("prevote: lease applies even with no leader to protect", "raft.py",
+     "        lease_intact = self.role is Role.LEADER or (\n            self.leader_id is not None",
+     "        lease_intact = self.role is Role.LEADER or (\n            True"),
+    ("prevote: campaign routed through the poll it must bypass", "raft.py",
+     "        await self._start_election(pre_vote=False)",
+     "        await self._start_election()"),
+    ("prevote: failed poll does not back off", "raft.py",
+     "            self._reset_election_timer()\n            role_before, term_before = self.role, self.current_term",
+     "            pass  # MUTANT: no backoff\n            role_before, term_before = self.role, self.current_term"),
+
     # ---- runtime tempo controls ----
     ("campaign: learner allowed to campaign", "raft.py",
      '        if not self.is_voter:\n            raise ValueError("this node is a learner; learners never campaign (§6)")',

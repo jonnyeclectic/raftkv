@@ -17,6 +17,8 @@ dev = [
     "mockito==2.0.4",
     "pytest-mockito==0.0.6.post1",
     "ruff==0.16.3",
+    "hypothesis==6.140.3",
+    "httpx2==2.10.0",  # test-only: starlette.testclient prefers it over httpx
 ]
 
 [build-system]

@@ -72,6 +72,10 @@ class RaftNode:
         self._replicate_now = asyncio.Event()   # submit() nudges the replication loop
         self._apply_ready = asyncio.Event()     # commit-index advances wake the applier
         self._waiters: dict[int, asyncio.Future[LogEntry]] = {}  # submits awaiting apply
+        # peer -> monotonic time of the last RPC RESPONSE it sent us. Leader-only, and the
+        # entire input to CheckQuorum: a leader that no longer hears back from a majority
+        # has already lost the election it does not know about yet. See _check_quorum.
+        self._last_contact: dict[str, float] = {}
         self.crashed = False                    # simulated failure; see crash()
         self.blocked: set[str] = set()          # simulated partition; see set_blocked()
         self._tasks: list[asyncio.Task] = []
@@ -181,6 +185,8 @@ class RaftNode:
 
     # ---- RPC receivers (synchronous => atomic under the event loop) --------
     def handle_request_vote(self, req: RequestVoteRequest) -> RequestVoteResponse:
+        if req.pre_vote:
+            return self._handle_pre_vote(req)  # BEFORE _observe_term; see there
         self._observe_term(req.term)
         if not self.is_voter:
             # Not in any configuration: this node is not part of any quorum, so its
@@ -199,6 +205,59 @@ class RaftNode:
         self.metrics.votes_granted += 1
         self._log("vote_granted", candidate=req.candidate_id)
         return RequestVoteResponse(term=self.current_term, vote_granted=True)
+
+    def _handle_pre_vote(self, req: RequestVoteRequest) -> RequestVoteResponse:
+        """Answer a straw poll (thesis §9.6): "would you vote for me at `req.term`?"
+
+        Three things this must NOT do, and each one is the entire point of the round:
+
+          * **Not observe the term.** `req.term` is one above the sender's own — a term
+            nobody is running in yet. Calling `_observe_term` here would inflate our term
+            on the strength of a question, which is exactly the disruption PreVote exists
+            to prevent, and would make the mechanism a more expensive version of the
+            problem.
+          * **Not persist a vote.** A pre-vote binds nothing, so §5.2's one-vote-per-term
+            rule has nothing to record. A node may answer any number of straw polls in a
+            term and still cast exactly one real vote.
+          * **Not reset the election timer.** Granting here is not "I heard from a leader".
+            Resetting would let a partitioned candidate suppress the elections of the very
+            nodes it is asking, by asking repeatedly.
+
+        The grant conditions are the real election's, plus a lease. `leader_id is not None`
+        is what makes the lease safe to apply: a node that currently believes in a leader
+        AND has heard from it inside one `election_timeout_min` refuses to help depose it,
+        while a node at cold start — or one whose leader has already gone quiet — knows of
+        no leader and answers freely. Without that first clause a fresh cluster would stall
+        for an extra election timeout on every boot, because every node would be inside its
+        own startup lease with no leader to protect.
+
+        A LEADER holds the lease unconditionally, and that clause is load-bearing rather
+        than tidy. A leader's `_last_reset` is stale for its entire tenure — deliberately,
+        see `_become_follower` — so the elapsed-time test alone reads a perfectly healthy
+        leader as one nobody has heard from, and it grants the poll of the first follower
+        whose timer drifts. That follower then wins its straw poll on the incumbent's own
+        vote and deposes it, which is a worse election storm than the one PreVote is here
+        to stop. `_check_quorum` is the sole authority on when a leader gives up; until it
+        fires, this node is the lease. (Found by a live three-node test, not by reading:
+        it is invisible in any unit test that stubs the peers.)
+
+        The lease is checked ONLY here, never on the real-vote path. `/admin/campaign` is
+        this repo's stand-in for leadership transfer, and the paper's TimeoutNow bypasses
+        PreVote for the same reason (§3.10): a transfer is the operator deposing a *healthy*
+        leader on purpose, which is precisely what the lease is built to refuse."""
+        lease_intact = self.role is Role.LEADER or (
+            self.leader_id is not None
+            and time.monotonic() - self._last_reset < self.cfg.election_timeout_min
+        )
+        granted = (
+            self.is_voter                      # a non-member's opinion is not counted
+            and req.term > self.current_term   # a poll for a term we have already passed
+            and not lease_intact               # someone is already leading, audibly
+            and (req.last_log_term, req.last_log_index) >= self._last_log_position()
+        )
+        # Our OWN term, not req.term: the reply is how a candidate that is behind learns it
+        # is behind and steps back without ever running.
+        return RequestVoteResponse(term=self.current_term, vote_granted=granted)
 
     def handle_append_entries(self, req: AppendEntriesRequest) -> AppendEntriesResponse:
         self._observe_term(req.term)
@@ -291,9 +350,102 @@ class RaftNode:
             raise ValueError("this node is a learner; learners never campaign (§6)")
         if self.role is Role.LEADER:
             raise ValueError(f"already the leader (term {self.current_term})")
-        await self._start_election()
+        # Skips the pre-vote deliberately, exactly as TimeoutNow does (thesis §3.10). The
+        # straw poll's job is to refuse elections that would disturb a healthy leader --
+        # which is the whole content of this button. Routed through PreVote the operator
+        # would press it and nothing would happen, and the steering wheel would come off in
+        # their hand. The election itself is unchanged, so the worst case is still a
+        # burnt term.
+        await self._start_election(pre_vote=False)
 
-    async def _start_election(self) -> None:
+    async def _poll_voters(self, req: RequestVoteRequest):
+        """Ask every OTHER voter for `req`, yielding (peer_id, response) as they land.
+
+        Shared by the straw poll and the real election so the two cannot drift: both must
+        span the union of BOTH voter halves (a joint configuration is decided by two
+        rosters, so a candidate that polled only C-new could believe it had won), both must
+        treat a blocked link exactly like an unreachable one, and both must cancel their
+        outstanding asks the moment the answer is known.
+
+        Yields WHO answered, not just what they said — an anonymous tally cannot be checked
+        against two rosters. Wrap in `contextlib.aclosing`: a consumer that stops early
+        would otherwise leave the fan-out running until the generator is collected."""
+        async def ask(peer_id: str) -> tuple[str, RequestVoteResponse] | None:
+            if peer_id in self.blocked:  # partitioned link: same shape as unreachable
+                self.metrics.rpc_failures += 1
+                return None
+            try:
+                return (peer_id, await self.transport.request_vote(peer_id, req))
+            except TransportError:
+                self.metrics.rpc_failures += 1
+                return None
+
+        voters = {*self.config.voters, *self.config.old_voters} - {self.cfg.node_id}
+        pending = [asyncio.create_task(ask(p)) for p in sorted(voters)]
+        try:
+            for future in asyncio.as_completed(pending):
+                answer = await future
+                if answer is not None:
+                    yield answer
+        finally:
+            for task in pending:
+                task.cancel()
+
+    async def _straw_poll(self) -> bool:
+        """The pre-election (thesis §9.6). Nothing here is persisted and our term does not
+        move: this is the round that decides whether running is worth the disruption.
+
+        It exists because of what CheckQuorum does to a partitioned leader. Stepping down
+        turns a quiet stale leader into a candidate, and a candidate with no majority burns
+        a term per election timeout forever -- so it rejoins after a minute's partition
+        tens of terms ahead, and that term alone deposes a leader that was serving fine.
+        CheckQuorum without PreVote trades an invisible failure for a noisy one. Together
+        they are the pair the thesis prescribes: step down when you cannot lead, and stay
+        quiet while you cannot win.
+
+        `_observe_term` still runs on the REPLIES. A poll is how a node returning from a
+        partition discovers it is behind, and discovering that is a legitimate reason to
+        adopt the higher term -- it costs nobody an election."""
+        term_if_we_run = self.current_term + 1
+        last_term, last_index = self._last_log_position()
+        req = RequestVoteRequest(
+            term=term_if_we_run, candidate_id=self.cfg.node_id,
+            last_log_index=last_index, last_log_term=last_term, pre_vote=True,
+        )
+        self.metrics.pre_votes_started += 1
+        self._log("pre_vote_started", would_be_term=term_if_we_run)
+        granted = {self.cfg.node_id}
+        if self._has_agreement(granted):  # a lone voter needs nobody's permission
+            return True
+        async with contextlib.aclosing(self._poll_voters(req)) as answers:
+            async for peer_id, resp in answers:
+                self._observe_term(resp.term)
+                # Stale-reply guard: a higher term landed, so the term we were polling for
+                # is already spent. We are behind, not a candidate.
+                if self.current_term + 1 != term_if_we_run:
+                    return False
+                if resp.vote_granted:
+                    granted.add(peer_id)
+                    if self._has_agreement(granted):
+                        return True
+        self._log("pre_vote_failed", granted=sorted(granted))
+        return False
+
+    async def _start_election(self, *, pre_vote: bool = True) -> None:
+        if pre_vote:
+            # Reset FIRST. A failed poll must cost a full election timeout before the next
+            # one; without this the timer loop re-fires on its next tick (one tenth of a
+            # timeout) and an isolated node polls its unreachable peers ten times as often
+            # as it would have campaigned.
+            self._reset_election_timer()
+            role_before, term_before = self.role, self.current_term
+            if not await self._straw_poll():
+                return
+            # Every await above yields. Re-validate before converting a poll into a
+            # candidacy: winning the straw poll of a term we have since left, or that we
+            # have since been elected in, must not restart an election.
+            if self.current_term != term_before or self.role is not role_before:
+                return
         self.role = Role.CANDIDATE
         self.current_term += 1
         self.voted_for = self.cfg.node_id
@@ -309,32 +461,14 @@ class RaftNode:
         )
         self._log("election_started")
 
-        # Returns WHO answered alongside the answer: joint agreement is decided by
-        # which rosters the granters belong to, so an anonymous tally is not enough.
-        async def ask(peer_id: str) -> tuple[str, RequestVoteResponse] | None:
-            if peer_id in self.blocked:  # partitioned link: same shape as unreachable
-                self.metrics.rpc_failures += 1
-                return None
-            try:
-                return (peer_id, await self.transport.request_vote(peer_id, req))
-            except TransportError:
-                self.metrics.rpc_failures += 1
-                return None
-
         # A SET of granters, not a counter: during a joint configuration the same votes
         # must be tallied against two rosters independently, and a bare count cannot be.
         granted = {self.cfg.node_id}  # our own; ignored if we are not a voter
         if self._has_agreement(granted):  # single-node cluster elects itself instantly
             self._become_leader()
             return
-        voters = {*self.config.voters, *self.config.old_voters} - {self.cfg.node_id}
-        pending = [asyncio.create_task(ask(p)) for p in sorted(voters)]
-        try:
-            for future in asyncio.as_completed(pending):
-                answer = await future
-                if answer is None:
-                    continue
-                peer_id, resp = answer
+        async with contextlib.aclosing(self._poll_voters(req)) as answers:
+            async for peer_id, resp in answers:
                 self._observe_term(resp.term)
                 # Stale-reply guard: if the world moved while we awaited, stop.
                 if self.role is not Role.CANDIDATE or self.current_term != term_when_started:
@@ -344,9 +478,6 @@ class RaftNode:
                     if self._has_agreement(granted):
                         self._become_leader()
                         return
-        finally:
-            for task in pending:
-                task.cancel()
 
     def _replication_targets(self) -> list[str]:
         """The UNION of both voter halves plus learners. Everyone is replicated to;
@@ -496,6 +627,14 @@ class RaftNode:
         last = self.storage.last_log_index()
         self.next_index = {p: last + 1 for p in self._replication_targets()}
         self.match_index = {p: 0 for p in self._replication_targets()}
+        # Seed CheckQuorum with "everyone was here just now". An unseeded map reads as a
+        # cluster nobody has ever answered, so the first _check_quorum would depose a
+        # leader elected a millisecond ago -- and it would do it every time, which is not a
+        # slow cluster, it is a cluster with no leader. The majority that just elected us
+        # is the evidence this seed stands on; it buys exactly one election timeout to
+        # replace it with real contact.
+        now = time.monotonic()
+        self._last_contact = {p: now for p in self._replication_targets()}
         self._log("became_leader", quorum=self.quorum)
         self._replicate_now.set()  # assert leadership with an immediate heartbeat
 
@@ -523,6 +662,11 @@ class RaftNode:
         except TransportError:
             self.metrics.rpc_failures += 1  # peer down is weather, not an error
             return
+        # CheckQuorum's only input, and recorded before anything is judged: ANY answer
+        # proves the link is two-way and the peer is alive. A rejection counts, because a
+        # follower repairing its log is a follower we can still reach — treating only
+        # successes as contact would depose a leader for the crime of having a peer behind.
+        self._last_contact[peer_id] = time.monotonic()
         self._observe_term(resp.term)
         # Stale-reply guard (Students' Guide): act only if nothing changed meanwhile.
         if self.role is not Role.LEADER or self.current_term != term_when_sent:
@@ -569,6 +713,44 @@ class RaftNode:
             if ours is not None:
                 proposed = ours + 1
         return max(1, min(proposed, current - 1))
+
+    def _check_quorum(self) -> None:
+        """Step down if a majority has not ANSWERED within one election timeout.
+
+        CheckQuorum (thesis §6.2). Raft guarantees one leader per term, not one leader: a
+        leader cut off from its followers keeps the role, keeps answering `/state` with
+        `role: leader`, and keeps serving reads from a state machine the rest of the
+        cluster has already moved past. Nothing in Figure 2 ever tells it otherwise —
+        deposition arrives in a message, and the whole problem is that no messages arrive.
+        So the leader's own silence has to be the signal.
+
+        Without this the staleness is unbounded IN TIME, not merely in value: a read served
+        by a partitioned leader is wrong for as long as the partition lasts. The dashboard
+        papers over it by polling every node and believing the highest term, which is a
+        luxury of watching all three at once; a client behind one address cannot.
+
+        The window is `election_timeout_max` — the longest any follower will wait before
+        campaigning — so this fires only once every voter that could have replaced us has
+        had the chance. `election_timeout_min` would be more aggressive and would sometimes
+        depose a leader while the cluster was still perfectly happy with it, which trades a
+        stale read for an outage.
+
+        We count ourselves and go through `_has_agreement`, so a joint configuration needs
+        contact with a majority of BOTH halves (§6) and a single-voter cluster never steps
+        down. Stepping down does NOT bump the term: this is a resignation, not a campaign.
+        `_become_follower` restarts the election timer, which is what gives the pre-vote
+        round below a full timeout to establish that we cannot win — see `_straw_poll`."""
+        if self.role is not Role.LEADER:
+            return
+        cutoff = time.monotonic() - self.cfg.election_timeout_max
+        reachable = {self.cfg.node_id} | {
+            peer for peer, seen in self._last_contact.items() if seen >= cutoff
+        }
+        if self._has_agreement(reachable):
+            return
+        self._log("quorum_lost", reachable=sorted(reachable), quorum=self.quorum)
+        self.leader_id = None
+        self._become_follower()
 
     def _commit_candidates(self) -> list[int]:
         """The only indices worth testing for agreement, highest first.
@@ -670,6 +852,10 @@ class RaftNode:
                 *(self._append_to_peer(p, term_when_sent)
                   for p in self._replication_targets())
             )
+            # After the round, not before: this round's answers are the freshest evidence
+            # there is, and judging on the previous round's would cost a whole heartbeat of
+            # accuracy for nothing.
+            self._check_quorum()
             # Heartbeat cadence minus time already spent this round — a slow peer must
             # not stretch the gap toward election_timeout. submit() cuts the wait short.
             remaining = max(
@@ -781,6 +967,7 @@ class RaftNode:
         self.leader_id = None
         self.next_index = {}
         self.match_index = {}
+        self._last_contact = {}
         # in-flight writes die with the node; TimeoutError is already the 504 path
         for waiter in self._waiters.values():
             if not waiter.done():
@@ -833,6 +1020,7 @@ class RaftNode:
         self.last_applied = last_applied
         self.next_index = {}
         self.match_index = {}
+        self._last_contact = {}
         self.blocked = set()
         self.metrics = Metrics()
         self._noop_index = 0

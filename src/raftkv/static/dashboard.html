@@ -1140,6 +1140,10 @@ function infraDetails(addr, s) {
 
   wrap.append(detailsBlock(addr, "metrics", "metrics", [
     row("elections started", s.metrics.elections_started),
+    // Sits directly above `elections started` because the pair is the reading: polls
+    // without elections is a node that keeps asking and keeps being told no — an isolated
+    // node, patiently not disrupting anyone. See Metrics.pre_votes_started.
+    row("pre-votes started", s.metrics.pre_votes_started ?? 0),
     row("votes granted", s.metrics.votes_granted),
     row("appends sent", s.metrics.append_entries_sent),
     row("appends received", s.metrics.append_entries_received),

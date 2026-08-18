@@ -54,6 +54,18 @@ election timer, replication/heartbeat loop, single apply loop — plus async flo
 (`_start_election`, `_append_to_peer`, `submit`). It knows nothing about HTTP or
 FastAPI: it talks to a `Transport` and a `Storage`.
 
+`_check_quorum` and `_straw_poll` are the other pair, and the same warning applies: neither
+is safe to ship without the other. CheckQuorum (thesis §6.2) makes a leader resign once a
+majority has stopped answering, because Raft only ever deposes a leader by message and a
+partitioned one receives none. But resigning turns a quiet stale leader into a candidate,
+and a candidate that can never reach a quorum burns a term per election timeout — so it
+rejoins tens of terms ahead and deposes a leader that was serving fine. PreVote (thesis
+§9.6) closes that: a node polls for the term it *would* run in, incrementing and persisting
+nothing, and stays a follower unless a majority encourages it. Together they read: step
+down when you cannot lead, stay silent while you cannot win. `/admin/campaign` skips the
+poll deliberately, exactly as TimeoutNow does (thesis §3.10) — a leadership transfer is the
+operator deposing a healthy leader on purpose, which is the one thing the poll refuses.
+
 `MAX_ENTRIES_PER_APPEND` (512) bounds one `AppendEntries`, and it is half of a pair. The
 batch used to be everything outstanding, to every follower, every round — measured at 2000
 pending: ~195 KiB per peer and ~33 ms of loop time per round across four of them, paid

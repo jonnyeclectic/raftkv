@@ -171,6 +171,12 @@ async def test_an_undialable_voter_does_not_kill_the_election_loop(tmp_path):
     than TransportError, which escaped the `except TransportError` in _start_election
     and killed _election_timer_loop for the life of the process. The node then sat as a
     follower forever, campaigning never again, with nothing logged to say so.
+
+    Asserted on `pre_votes_started` rather than `elections_started` since PreVote landed:
+    the undialable peer is now dialled first by the straw poll, so that is where a
+    non-TransportError would escape -- and a node that cannot reach a quorum deliberately
+    never starts a real election at all (thesis §9.6). Same regression, same loop, one
+    round earlier.
     """
     from raftkv.transport import MemoryTransport
 
@@ -182,7 +188,7 @@ async def test_an_undialable_voter_does_not_kill_the_election_loop(tmp_path):
     transport.register("node-1", node)
     node.start()
     try:
-        await eventually(lambda: node.metrics.elections_started >= 3, timeout=3.0)
+        await eventually(lambda: node.metrics.pre_votes_started >= 3, timeout=3.0)
         assert all(not task.done() for task in node._tasks), \
             "an unreachable voter killed a background task"
     finally:

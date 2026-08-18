@@ -270,5 +270,12 @@ question about how it behaves under stress. The full workings are in
   startup voter set and could therefore acknowledge a write and lose it.
   `tests/test_reset.py::test_reset_cannot_shrink_a_grown_cluster_into_a_second_quorum`.
 - **Where it fails.** Table 2 — every omission named with what breaks at scale and
-  the production fix. One of them, PreVote, is visible in the demo itself when a revived
-  node forces an election.
+  the production fix. The sharpest remaining one is linearizable reads: CheckQuorum now
+  bounds how long a partitioned leader can claim the role, but bounded is not linearizable,
+  and a leader holding quorum still has no proof *at the moment of the read* that it was
+  not deposed a millisecond ago. ReadIndex is the fix; CheckQuorum was its precondition.
+- **Why CheckQuorum shipped with PreVote.** Alone it is not a fix — it converts a silent
+  stale leader into one that burns a term per election timeout
+  and disrupts a healthy leader on heal. PreVote shipped in the same change for that
+  reason (thesis §9.6), and the pair is why a partitioned node now returns at the term it
+  left with. `tests/test_check_quorum.py`, `tests/test_pre_vote.py`.

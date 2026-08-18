@@ -4,6 +4,13 @@ A partition is not a crash, and the gap between them is the most interesting thi
 this cluster does: a partitioned leader stays up, keeps accepting writes, and cannot
 commit a single one of them. Crash-testing never shows you that, because a crashed
 leader simply stops.
+
+Since CheckQuorum landed that gap is TIME-BOUNDED rather than permanent (thesis §6.2).
+The leader still accepts and still cannot commit -- nothing about the quorum arithmetic
+moved -- but it now notices its own silence and resigns after one election timeout
+instead of claiming the role for the length of the partition. Both halves are asserted
+below, and the ordering between them is the whole behaviour: the window is real, and it
+closes.
 """
 
 import asyncio
@@ -11,6 +18,7 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
+from conftest import eventually
 from raftkv.app import create_app
 from raftkv.models import Command, Role
 from raftkv.raft import RaftNode
@@ -39,7 +47,12 @@ def test_blocked_peer_is_skipped_outbound_and_counted_as_an_rpc_failure(tmp_path
 
 def test_partitioned_leader_accepts_the_write_and_cannot_commit_it(tmp_path):
     """The headline behaviour. Quorum is 2 of 3; with both followers unreachable the
-    leader holds the entry in its log forever and the client times out."""
+    leader holds the entry in its log and the client times out.
+
+    The write is submitted before the node starts, so the assertions land inside the
+    CheckQuorum window rather than racing it: the point here is that a partitioned leader
+    is not a crashed one. It is up, it is still the leader, and it accepts work it will
+    never be able to finish. The step-down that ends that window is the test below."""
     async def scenario():
         node = make_node(tmp_path)
         node.current_term = 1
@@ -50,12 +63,60 @@ def test_partitioned_leader_accepts_the_write_and_cannot_commit_it(tmp_path):
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(
                 node.submit(Command(op="set", key="k", value="v", request_id="r1")),
-                timeout=1.5,
+                timeout=0.15,  # inside election_timeout_max (0.2), so still leading
             )
         # index 1 is the no-op appended on winning; index 2 is the doomed write
         assert node.storage.last_log_index() == 2  # appended...
         assert node.commit_index == 0              # ...neither can ever commit
         assert node.role is Role.LEADER            # and still leader: this is not a crash
+        await node.stop()
+        node.storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_partitioned_leader_resigns_once_it_has_heard_from_nobody(tmp_path):
+    """CheckQuorum (thesis §6.2). Raft guarantees one leader per TERM, not one leader --
+    so nothing in Figure 2 ever tells a leader it has been replaced when the telling is
+    what the partition prevents. Its own silence has to be the signal.
+
+    Without this the node above stays `role: leader` for the length of the partition, and
+    every read it serves is stale for exactly that long: unbounded in time, not merely in
+    value. The dashboard hides it by polling all three nodes and believing the highest
+    term, which a client behind one address cannot do.
+
+    Resigning must NOT bump the term -- this is a resignation, not a campaign -- and with
+    PreVote in front of the election timer the deposed node then stays quiet instead of
+    burning a term per timeout. That pairing is what makes the resignation free: see
+    tests/test_pre_vote.py."""
+    async def scenario():
+        node = make_node(tmp_path)
+        node.current_term = 1
+        node._become_leader()
+        node.set_blocked(["node-2", "node-3"])
+        node.start()
+
+        await eventually(lambda: node.role is not Role.LEADER, timeout=2.0)
+        assert node.leader_id is None       # it does not know who leads now, and says so
+        assert node.current_term == 1       # a resignation, not a campaign
+        await node.stop()
+        node.storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_lone_voter_never_resigns(tmp_path):
+    """The boundary CheckQuorum must not cross. A single-voter cluster IS its own
+    majority, so it is in contact with a quorum by definition and no amount of silence
+    from nobody can depose it. Getting this wrong turns a one-node cluster into a node
+    that resigns every election timeout and can never be written to."""
+    async def scenario():
+        node = make_node(tmp_path, peers=())
+        node.current_term = 1
+        node._become_leader()
+        node.start()
+        await asyncio.sleep(0.5)  # several election timeouts at test timing
+        assert node.role is Role.LEADER
         await node.stop()
         node.storage.close()
 
