@@ -131,7 +131,21 @@ async def test_a_wiped_follower_is_repaired(counted):
     node = counted.nodes[victim]
     assert node.storage.kv_get("gap00000") == "v0"
     assert node.storage.kv_get(f"gap{GAP - 1:05d}") == f"v{GAP - 1}"
-    assert node.storage.last_log_index() == target
+
+    # Against the leader's log as it stands NOW, not the snapshot `target` took before the
+    # repair. An election inside the repair window appends a NoOp from the new term (§6.4),
+    # so the cluster legitimately grows by one and the snapshot goes stale -- this asserted
+    # `1502 == 1501` on a CI runner and read as a repair bug. What repair actually has to
+    # produce is a follower whose log matches the leader's, which is what this says, and it
+    # is no weaker: an extra or missing entry on the victim still fails it.
+    def matches_the_leader() -> bool:
+        current = counted.leader()
+        return (
+            current is not None
+            and node.storage.last_log_index() == current.storage.last_log_index()
+        )
+
+    await eventually(matches_the_leader, timeout=20)
 
 
 async def test_repairing_a_wiped_follower_takes_a_handful_of_round_trips(counted):
