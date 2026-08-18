@@ -38,7 +38,7 @@ from uuid import uuid4
 import pytest
 
 from chaos import ChaosTransport
-from conftest import SimCluster, eventually
+from conftest import SimCluster, eventually, scaled
 from invariants import RaftInvariantMonitor, assert_no_acknowledged_write_is_lost
 from raftkv.models import Command
 from raftkv.raft import NotLeaderError
@@ -49,15 +49,15 @@ from raftkv.transport import TransportError
 # election storm, which is a test of the harness rather than of Raft. Must still satisfy
 # NodeConfig's startup validation (heartbeat < election_min, rpc_timeout + heartbeat <
 # election_min), or the node refuses to boot.
-CHAOS_TIMING = {
-    "heartbeat_interval": 0.05,
-    "election_timeout_min": 0.3,
-    "election_timeout_max": 0.6,
-    "rpc_timeout": 0.1,
+CHAOS_TIMING = scaled(
+    heartbeat_interval=0.05,
+    election_timeout_min=0.3,
+    election_timeout_max=0.6,
+    rpc_timeout=0.1,
     # Short on purpose: a write that cannot commit should fail fast and let the run
     # continue, not park the test for two seconds.
-    "commit_timeout": 0.5,
-}
+    commit_timeout=0.5,
+)
 
 STEPS = 20
 

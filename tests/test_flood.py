@@ -19,7 +19,7 @@ See docs/FAILURE_MODES.md for the throughput ceiling this exposes.
 
 import asyncio
 
-from conftest import SimCluster, eventually
+from conftest import SimCluster, eventually, scaled
 from raftkv.models import Command
 from raftkv.raft import NotLeaderError
 
@@ -36,7 +36,7 @@ OUTCOMES = {"ok", "not_leader", "timeout"}
 #
 # commit_timeout is deliberately NOT set here: widening it is what separates the strict
 # tests from the stress one, and that distinction is the point of the file.
-STABLE_LEADER = {"election_timeout_min": 0.5, "election_timeout_max": 1.0}
+STABLE_LEADER = scaled(election_timeout_min=0.5, election_timeout_max=1.0)
 
 
 def assert_leadership_held(sim: SimCluster, leader, results) -> None:

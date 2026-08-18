@@ -38,7 +38,7 @@ sets — `test_append_batching.py::test_a_still_behind_follower_triggers_another
 
 import pytest
 
-from conftest import SimCluster, eventually
+from conftest import SimCluster, eventually, scaled
 from raftkv.models import Command
 from raftkv.raft import MAX_ENTRIES_PER_APPEND
 
@@ -91,11 +91,11 @@ class CountingTransport:
 # repair being measured: a successful append that leaves the peer behind re-fires
 # replication immediately rather than waiting for the next heartbeat, which is the coupling
 # MAX_ENTRIES_PER_APPEND ships with.
-STABLE_LEADER = {
-    "election_timeout_min": 0.5,
-    "election_timeout_max": 1.0,
-    "heartbeat_interval": 0.1,
-}
+STABLE_LEADER = scaled(
+    election_timeout_min=0.5,
+    election_timeout_max=1.0,
+    heartbeat_interval=0.1,
+)
 
 
 @pytest.fixture

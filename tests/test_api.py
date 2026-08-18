@@ -4,6 +4,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from conftest import scaled
 from raftkv.app import create_app
 from raftkv.config import NodeConfig
 from raftkv.models import Role
@@ -12,8 +13,9 @@ from raftkv.models import Role
 def build_cfg(tmp_path, **overrides):
     params = dict(
         node_id="solo", peers={}, db_path=str(tmp_path / "solo.db"),
-        log_dir=str(tmp_path / "logs"), heartbeat_interval=0.03,
-        election_timeout_min=0.1, election_timeout_max=0.2,
+        log_dir=str(tmp_path / "logs"), **scaled(
+            heartbeat_interval=0.03, election_timeout_min=0.1, election_timeout_max=0.2
+        ),
         rpc_timeout=0.05, commit_timeout=2.0,
     )
     params.update(overrides)

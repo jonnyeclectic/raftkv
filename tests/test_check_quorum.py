@@ -81,9 +81,14 @@ def test_the_window_is_the_full_election_timeout(make_node):
     every voter that could have replaced us has had its chance. Tightening it to
     `election_timeout_min` would sometimes depose a leader the cluster was still
     perfectly happy with, trading a stale read for an election."""
-    window = 0.2  # conftest TEST_TIMING election_timeout_max
-    inside = lead(make_node(), contacts={"node-2": ago(window * 0.5),
-                                         "node-3": ago(99.0)})
+    # Read from the node rather than restated as a literal: the fixture's timers scale
+    # with RAFT_TEST_TIMING_SCALE, and a hardcoded 0.2 here silently becomes an assertion
+    # that the window is SHORTER than it is, which passes for the wrong reason at 1x and
+    # fails outright above it.
+    node = make_node()
+    window = node.cfg.election_timeout_max
+    inside = lead(node, contacts={"node-2": ago(window * 0.5),
+                                  "node-3": ago(99.0)})
     inside._check_quorum()
     assert inside.role is Role.LEADER
 

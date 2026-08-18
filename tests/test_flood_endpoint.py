@@ -76,7 +76,17 @@ def test_a_second_flood_is_refused_rather_than_queued(client):
     """Two overlapping generators would make the counters impossible to attribute, so
     the second one is a 409 -- the same "not now" the promote button answers."""
     wait_for_leader(client)
-    client.post("/admin/flood", json={"total": 400, "concurrency": 400})
+    first = client.post("/admin/flood", json={"total": MAX_TOTAL, "concurrency": 400})
+    assert first.status_code == 200
+
+    # The refusal only means anything while the first burst is genuinely in flight, so
+    # that precondition is asserted rather than assumed. It used to be neither: a 400-write
+    # burst finished between the two calls on a slow shared runner, the second was accepted
+    # on its merits, and the test reported "no 409" as though the guard had broken.
+    assert client.get("/admin/flood").json()["running"] is True, (
+        "the first flood finished before the second request; it is too small to race against"
+    )
+
     second = client.post("/admin/flood", json={"total": 5, "concurrency": 1})
     assert second.status_code == 409
     assert "already running" in second.text
