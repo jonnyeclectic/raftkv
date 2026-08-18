@@ -21,6 +21,27 @@ you see is the cluster reacting, not the UI.
 
 ## Quickstart
 
+### 1. Install everything
+
+One paste, on a machine that has none of this:
+
+```bash
+command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv python install 3.14
+make install
+```
+
+`uv` is the only thing this needs from outside. It provisions Python 3.14 itself (the
+project sets `requires-python = ">=3.14"`), and `make install` — `uv sync --all-extras` —
+builds `.venv/` from `uv.lock`, so every dependency is the exact version CI resolved.
+Nothing lands system-wide, and removing `.venv/` undoes all of it.
+
+On Windows, swap the first line for
+`powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`; the rest is unchanged.
+
+### 2a. Run it in containers
+
 ```bash
 make demo          # docker compose up -d --wait --build
 # open http://localhost:8001/   <- the dashboard (any node serves it)
@@ -33,6 +54,40 @@ on the dev machine that produced it is the classic failure mode:
 ```bash
 make clean-start-check
 ```
+
+### 2b. Run it as local processes, no Docker
+
+`make run-local` starts nodes **2 and 3 only** and leaves node-1 to you, which is what makes
+the leader a process you can pause. Paste the whole block:
+
+```bash
+make run-local
+source .venv/bin/activate
+RAFT_NODE_ID=node-1 RAFT_DB_PATH=data/node-1.db RAFT_LOG_DIR=logs \
+RAFT_PEERS=node-2=127.0.0.1:8002,node-3=127.0.0.1:8003 \
+RAFT_ADVERTISE=127.0.0.1:8001 RAFT_PORT=8001 \
+python scripts/debug_node.py
+```
+
+Then open **http://127.0.0.1:8002/** — node-2's copy of the dashboard. Serve it from a node
+you are *not* pausing, or the page stops updating along with the node.
+
+That environment is not decoration, and every line of it has cost time here:
+
+- **`RAFT_PEERS`** is what makes this a cluster. Without it the process starts a
+  perfectly healthy cluster of one, elects itself, and commits every write instantly —
+  which looks like success until you notice nothing replicated.
+- **`RAFT_ADVERTISE`** is the address this node writes into the configuration entry that
+  replicates to everyone else. It is required even here, where node-1 bootstraps: leave it
+  empty and a later-joined member ends up holding a voter it can never dial.
+- **`127.0.0.1`, never `localhost`** — `localhost` resolves to `::1` or `127.0.0.1`
+  depending on the machine, and a compose cluster publishes on both while a local node
+  binds only the latter. The same string can then reach two different clusters.
+
+To drive node-1 from an IDE debugger rather than a terminal, the run configuration is under
+[Starting the local cluster](#starting-the-local-cluster); `scripts/debug_node.py` is a
+**script** target, not `module: uvicorn`, and its docstring explains why that distinction
+is load-bearing on Python 3.14.
 
 ### Which build am I looking at?
 
