@@ -42,6 +42,11 @@ DOC_CITATION = re.compile(r"\(docs/([A-Za-z0-9_]+\.md)\)")
 # the `tests/` prefix so no sentence can match by accident.
 ANY_CITATION = re.compile(r"tests/(test_[a-z0-9_]+\.py)(?:::([A-Za-z0-9_]+))?")
 
+# `![alt](Dashboard.png)` — an image the shipped prose EMBEDS, as opposed to links. Only
+# relative paths are a claim about this repository; an `http(s)://` source is somebody
+# else's uptime and nothing here can assert it.
+IMAGE_EMBED = re.compile(r"!\[[^\]]*\]\((?!https?://)([^)\s]+)\)", re.DOTALL)
+
 # `raft.py::submit` — a shipped document naming a symbol in the tree. Anchored on the
 # backticks AND on the `::`, so ordinary prose about a module ("see raft.py") cannot
 # match; only the deliberate form is a claim this test has to honour.
@@ -109,6 +114,38 @@ def test_every_readme_doc_link_resolves():
     broken = sorted(name for name in linked if not (REPO / "docs" / name).is_file())
     assert not broken, (
         f"README.md links {len(broken)} document(s) that do not exist: {', '.join(broken)}"
+    )
+
+
+def test_every_embedded_image_exists():
+    """A link that rots gives the reader a 404 they can see and report. An IMAGE that rots
+    renders as a broken icon on github.com, above the fold, on the page a reviewer opens
+    first — and it fails silently in every other check here, because no import and no
+    markdown linter resolves an `src` against the working tree."""
+    broken = sorted(
+        {
+            f"{doc.name} embeds {src}"
+            for doc in PROSE
+            for src in IMAGE_EMBED.findall(doc.read_text(encoding="utf-8"))
+            if not (doc.parent / src).is_file()
+        }
+    )
+    assert not broken, (
+        f"{len(broken)} embedded image(s) resolve to nothing:\n  "
+        + "\n  ".join(broken)
+        + "\nResolved relative to the embedding document, the way a renderer does."
+    )
+
+
+def test_the_image_regex_still_matches_something():
+    """The floor the check above needs. `test_every_embedded_image_exists` passes on an
+    empty match set, so a regex broken by a change in how the prose writes an embed would
+    leave it green forever while verifying nothing — the same failure mode citations()
+    guards against with its own count assertion."""
+    found = [src for doc in PROSE for src in IMAGE_EMBED.findall(doc.read_text("utf-8"))]
+    assert found, (
+        "the image-embed regex matched nothing across the shipped prose. Either every "
+        "image was removed, or the regex stopped matching the way they are written."
     )
 
 
