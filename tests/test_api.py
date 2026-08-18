@@ -270,10 +270,21 @@ def test_dashboard_exposes_membership_and_reset_controls(client):
 
 def test_dashboard_has_every_management_control(client):
     """The dashboard is the operator surface: every failure and membership control has
-    to be reachable without dropping to a terminal."""
+    to be reachable without dropping to a terminal.
+
+    Attaching is deliberately ONE control. The CONTROL panel used to carry a typed-address
+    box beside the staged row's `attach as learner`, and two ways in read as two different
+    operations -- the typed one restated a card the page had already drawn. `?probe=` is
+    what gets an unprobed address a card in the first place, so it is the only path that
+    ever needed to exist. The assertion therefore moved to the card's own button: that is
+    now the sole way in, which makes it the thing whose quiet loss nobody would notice."""
     page = client.get("/").text
-    for control in ['id="setbtn"', 'id="delbtn"', 'id="addbtn"', 'id="healbtn"']:
+    for control in ['id="setbtn"', 'id="delbtn"', 'id="healbtn"']:
         assert control in page, control
+    # Rendering and binding asserted as a pair: a redesign once dropped the markup while
+    # leaving the function behind, and every check that grepped for the FUNCTION passed.
+    assert '"attach as learner"' in page, "the staged card lost its attach button"
+    assert "attach(addr)" in page, "attach as learner renders but is bound to nothing"
     assert "/admin/${action}" in page  # kill / revive post to the node itself
     assert "/admin/partition" in page  # cut / heal links
     assert "/admin/add-learner" in page  # join a non-voting member
