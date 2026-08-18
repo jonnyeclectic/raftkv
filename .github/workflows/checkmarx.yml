@@ -1,0 +1,76 @@
+# Checkmarx CxFlow: SAST against a self-hosted Checkmarx server, uploaded to GitHub as
+# SARIF so findings land in the Security tab beside CodeQL's.
+#
+# This is a THIRD-PARTY action, not one certified by GitHub, and it needs a reachable
+# Checkmarx server plus six credentials. Until they exist as repository secrets the scan
+# skips itself rather than failing: an unconfigured optional scanner that reds every pull
+# request teaches people to ignore a red check, which costs more than the scanner was ever
+# going to catch. Set the secrets and it starts working with no further edit here.
+#
+# It is deliberately NOT part of the `gate` aggregation in ci.yml. `gate` is the required
+# check and every job it names must be able to pass on a fork, from a clean clone, with no
+# account anywhere. This one cannot.
+
+name: CxFlow
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: '19 10 * * 6'
+
+# Starts at nothing and is widened per job, which tests/test_ci_gate.py asserts for every
+# workflow in this directory.
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read          # actions/checkout
+      issues: write           # cxflow opens issues for findings
+      pull-requests: write    # cxflow comments findings on the PR
+      security-events: write  # upload-sarif writes into the Security tab
+      actions: read           # upload-sarif needs it on a private repository
+    # `secrets` is not available in a step-level `if`, but it IS available in a job-level
+    # `env`, so the presence check happens once here and the steps read the result.
+    env:
+      CX_CONFIGURED: ${{ secrets.CHECKMARX_URL != '' && secrets.CHECKMARX_USERNAME != '' && secrets.CHECKMARX_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The default leaves a usable GITHUB_TOKEN in .git/config for the whole job,
+          # where any later step — including a third-party container — can read it.
+          persist-credentials: false
+
+      - name: Checkmarx CxFlow Action
+        if: env.CX_CONFIGURED == 'true'
+        # The stock GitHub template pins 49d8269, which is v1.5 from May 2022. v2.3 is the
+        # current release.
+        uses: checkmarx-ts/checkmarx-cxflow-github-action@bfcb4817aadf2f63c9665ad901acfabd2410976e # v2.3
+        with:
+          project: ${{ secrets.CHECKMARX_PROJECT }}
+          team: ${{ secrets.CHECKMARX_TEAMS }}
+          checkmarx_url: ${{ secrets.CHECKMARX_URL }}
+          checkmarx_username: ${{ secrets.CHECKMARX_USERNAME }}
+          checkmarx_password: ${{ secrets.CHECKMARX_PASSWORD }}
+          checkmarx_client_secret: ${{ secrets.CHECKMARX_CLIENT_SECRET }}
+          scanners: sast
+          params: --namespace=${{ github.repository_owner }} --repo-name=${{ github.event.repository.name }} --branch=${{ github.ref }} --cx-flow.filter-severity --cx-flow.filter-category --checkmarx.disable-clubbing=true --repo-url=${{ github.event.repository.url }}
+
+      - name: Upload SARIF file
+        # Guarded on the file, not only on the scan: the scan can run and still produce
+        # nothing to upload, and upload-sarif fails on a missing path.
+        if: env.CX_CONFIGURED == 'true' && hashFiles('cx.sarif') != ''
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: cx.sarif
+
+      - name: Say why this was a no-op
+        if: env.CX_CONFIGURED != 'true'
+        run: |
+          echo "::notice::Checkmarx secrets are not configured, so no scan ran." \
+               "Set CHECKMARX_URL, CHECKMARX_USERNAME and CHECKMARX_PASSWORD to enable it."
