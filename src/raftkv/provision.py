@@ -252,18 +252,24 @@ async def spawn(
     elif await _port_is_bound(PORT_BASE + ordinal):
         raise ProvisionError(f"port {PORT_BASE + ordinal} is already in use.")
 
-    port = PORT_BASE + ordinal
-    node_id = f"node-{ordinal}"
+    safe_ordinal = int(ordinal)
+    port = PORT_BASE + safe_ordinal
+    node_id = f"node-{safe_ordinal}"
     addr = f"127.0.0.1:{port}"
 
     pathlib.Path("data").mkdir(exist_ok=True)
-    pathlib.Path(log_dir).mkdir(parents=True, exist_ok=True)
-    stdout = pathlib.Path(log_dir) / f"{node_id}.stdout"
+    log_root = pathlib.Path(log_dir).resolve()
+    log_root.mkdir(parents=True, exist_ok=True)
+    stdout = (log_root / f"node-{safe_ordinal}.stdout").resolve()
+    try:
+        stdout.relative_to(log_root)
+    except ValueError as exc:
+        raise ProvisionError("resolved log path escapes configured log_dir") from exc
 
     with stdout.open("ab") as sink:
         child = await asyncio.create_subprocess_exec(
             *_argv(port),
-            env=_child_env(node_id, addr, log_dir),
+            env=_child_env(node_id, addr, str(log_root)),
             stdout=sink,
             stderr=asyncio.subprocess.STDOUT,
             # Its own session, so it survives whatever kills this node's shell. A staged
