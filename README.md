@@ -278,20 +278,22 @@ Four things in that configuration are load-bearing, and each has already cost ti
 make node-up N=6      # node-6 on 127.0.0.1:8006, staged
 ```
 
-It prints the two ways to bring it in:
+It prints the URL that brings it in — reopen the dashboard at
+`http://127.0.0.1:8002/?probe=8004,8005,8006` and node-6 appears in the staged row, with
+**attach as learner** on its own card. `?probe=` **replaces** the default list rather than
+adding to it, so keep 8004 and 8005 in it or those two stop being watched. The default is
+short on purpose: every address on it is a fetch twice a second for the whole session.
 
-- **Attach it directly** — type `127.0.0.1:8006` into **attach by address** in the CONTROL
-  panel. One step, and it lands in the cluster as a learner.
-- **Or see it in the staged row first** — reopen the dashboard at
-  `http://127.0.0.1:8002/?probe=8004,8005,8006` (the script prints this URL) and attach it
-  from its own card. `?probe=` **replaces** the default list rather than adding to it, so
-  keep 8004 and 8005 in it or those two stop being watched. The default is short on
-  purpose: every address on it is a fetch twice a second for the whole session.
+Attaching is one control, not two. A typed-address box in the CONTROL panel would be a
+second way to do what the card already does, and the card is strictly better informed —
+it is drawn from the node's own `/state`, so it can only offer to attach something that
+answered. Probing is what makes the card exist, which leaves nothing for a typed address
+to reach that `?probe=` did not already reach first.
 
 Only *staged* nodes need probing at all. Once a node is in the configuration the page adopts
 it automatically — the configuration is a replicated log entry carrying each member's
 address, so any node hands it over in `/state`. That is what makes a page reload safe: a
-promoted node-4, or a node-6 attached by address, comes back without the query string.
+promoted node-4, or an attached node-6, comes back without the query string.
 
 Either way it arrives *non-voting*, and **promote to voter** is a separate step. Scaling
 back down is not implemented: removing a voter is another configuration change, and it has

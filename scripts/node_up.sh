@@ -46,13 +46,15 @@ for _ in $(seq 1 40); do
     cat <<EOF
 
 $ID is up on $ADDR — STAGED: a learner with no peers, in nobody's configuration.
-A replica is a process, not a cluster member. To make it one, from the dashboard:
+A replica is a process, not a cluster member. To make it one, open the dashboard on an
+address that is probing this one:
 
-  attach by address   type $ADDR, press attach   (learner: quorum does not move)
-  promote to voter    on its card                (joint consensus, one voter at a time)
-
-To watch it sit in the staged row first, open the dashboard with:
   http://127.0.0.1:8002/?probe=8004,8005,$PORT
+
+$ID then sits in the staged row, and both steps are on its own card:
+
+  attach as learner   (quorum does not move, so no joint consensus)
+  promote to voter    (joint consensus, one voter at a time)
 
 Stop it again (only safe while it is still STAGED — once it is a voter, killing the
 process is a failure, not a scale-down): pkill -f "create_app --port $PORT"

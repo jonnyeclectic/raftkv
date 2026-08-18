@@ -370,12 +370,6 @@
           <button id="provbtn" type="button">provision node</button>
           <span class="label">starts a process · in no cluster until attached</span>
         </div>
-        <!-- Escape hatch for an address this tab is not probing (a kubectl port-forward,
-             a node on another host). The staged cards are the normal path. -->
-        <div class="ctl">
-          <input id="newaddr" placeholder="host:port" autocomplete="off">
-          <button id="addbtn" type="button">attach by address</button>
-        </div>
         <div class="ctl">
           <button id="healbtn" type="button">heal all links</button>
           <button id="resetbtn" type="button" class="danger">reset all nodes</button>
@@ -1453,17 +1447,6 @@ async function healAll() {
   setStatus(`healed ${ok}/${NODES.length} nodes`, ok === NODES.length ? "ok" : "err");
 }
 
-// Join a running-but-idle node as a NON-VOTING learner. Quorum does not move, so this
-// needs no joint consensus (§6) -- the node just starts receiving the log and catches
-// up through the ordinary nextIndex walk.
-async function addNode() {
-  const input = document.getElementById("newaddr");
-  if (!input) return;
-  const addr = input.value.trim();
-  if (!ADDR_SHAPE.test(addr)) return setStatus("address must be host:port", "err");
-  if (await attach(addr)) input.value = "";
-}
-
 // Step ONE of growing the cluster: start a process. It comes back staged -- a learner
 // with an empty voter set, in nobody's configuration -- and stays that way until someone
 // presses attach. Deliberately two presses; see provision.py.
@@ -1709,7 +1692,6 @@ function frame(ts) {
 document.getElementById("setbtn")?.addEventListener("click", write);
 document.getElementById("delbtn")?.addEventListener("click", removeKey);
 document.getElementById("provbtn")?.addEventListener("click", provisionNode);
-document.getElementById("addbtn")?.addEventListener("click", addNode);
 document.getElementById("healbtn")?.addEventListener("click", healAll);
 document.getElementById("resetbtn")?.addEventListener("click", resetAll);
 document.getElementById("floodbtn")?.addEventListener("click", startFlood);
@@ -1724,9 +1706,6 @@ for (const id of ["key", "value"]) {
     if (e.key === "Enter") { e.preventDefault(); write(); }
   });
 }
-document.getElementById("newaddr")?.addEventListener("keydown", e => {
-  if (e.key === "Enter") { e.preventDefault(); addNode(); }
-});
 
 tick();
 setInterval(tick, 500);
