@@ -107,6 +107,13 @@ sequenceDiagram
   N1->>N3: AppendEntries (heartbeat)
 ```
 
+"No leader heard from recently" is the PreVote lease, and it means exactly that: the
+receiver's clock for it is the last **AppendEntries from the leader it believes in**, not
+its own election timer. The two look interchangeable and are not — the election timer is
+also pushed forward by granting a vote and by starting an election of one's own, so
+reading it as a lease makes every candidate cite its own campaign as proof that the leader
+is alive and refuse the next candidate. See docs/FAILURE_MODES.md, Table 1c.
+
 ## A write, replicated and committed
 
 ```mermaid
@@ -125,6 +132,47 @@ sequenceDiagram
   L-->>C: 200 {"ok": true}
   Note over F2,F3: next heartbeat carries commit 2 -> followers apply
 ```
+
+## Three state machines, three scopes
+
+"The state machine" in Raft usually means the key/value store the log is replayed into.
+A node is running three, at three different scopes, and conflating them is where a lot of
+confusion about the algorithm lives:
+
+| scope | machine | states | authority |
+|---|---|---|---|
+| one per **node** | role | follower, candidate, leader | `role` |
+| one per **term** | ballot | no vote, granted, voted for itself | `voted_for` |
+| one per **index** | log entry | appended, committed, applied (and truncated) | `commit_index`, `last_applied` |
+
+They are not layers of one diagram. "Granted" is not a role, and "committed" is not
+something a *node* is — it is something an *entry* is, and one node holds thousands of
+entries in different stages at the same instant. `last_applied <= commit_index <=
+last_log_index` holds always, which is why three watermarks are enough to place every
+index in exactly one stage. "Holds always" is now asserted rather than assumed:
+`tests/invariants.py` checks it, and per-node monotonicity of each watermark, on every
+observation of a randomized run — the check that caught a receiver rule dropping
+`commit_index` below `last_applied` on a lagging heartbeat (FAILURE_MODES.md table 1c).
+
+Two of these automata are defined as much by the edge they *lack* as by the ones they
+have, and both of those absences are safety properties:
+
+- **The ballot has no edge from one spent state to a differently-spent one.** Within a
+  term, `voted_for` is written once: rule 6 grants only when `voted_for` is `None` or
+  already the same candidate, and only a higher term clears it. That missing edge *is*
+  Election Safety at its source — two leaders in one term requires some voter to have
+  taken it.
+- **The log has no edge from `committed` back out.** Truncation (§5.3) exists and is
+  routine, but only from `appended`. A cut at or below `commit_index` erases an entry a
+  majority acknowledged and a client may have been told about, which is State Machine
+  Safety breaking.
+
+The dashboard draws all three per node and flags either of those two edges in red if it
+ever sees one. A straw poll appears on the first two as a **self-loop**: PreVote's whole
+claim is that a node which would lose does not run, so it changes neither its role nor its
+ballot. `tests/test_dashboard_state_machines.py` and
+`tests/test_dashboard_role_automaton.py` run that reconstruction under node.
+
 
 ## Partitioned leader: the safety story
 

@@ -34,8 +34,10 @@ not (each with what breaks at scale and the production fix).
 
 Four of these were found by pointing agents at the implementation with instructions to
 produce two leaders or a lost commit, rather than to check that it worked. Three more
-findings were investigated and refuted. The last row was found by running the load
-generator and reading its own output sceptically. Each row is now a regression test.
+findings were investigated and refuted. One row was found by running the load
+generator and reading its own output sceptically, and one by driving the dashboard in a
+real browser and measuring the cluster's answers rather than reading its code. Each row
+is now a regression test.
 
 | Bug | Why it was dangerous | Fix |
 |---|---|---|
@@ -44,14 +46,46 @@ generator and reading its own output sceptically. Each row is now a regression t
 | An undialable peer raised `KeyError`, not `TransportError` | It escaped every `except TransportError` and **killed the election timer permanently**. The node sat as a follower forever, campaigning never again, with nothing logged | Both transports raise `TransportError` for an unknown or address-less peer. `RAFT_ADVERTISE` is now set on bootstrap nodes too, since an empty one is what put an undialable voter in the configuration. `tests/test_membership_growth.py::test_an_undialable_voter_does_not_kill_the_election_loop` |
 | A node whose background loop died stayed leader and kept reporting healthy | `_apply_loop` dies on any storage error — a full disk is one `sqlite3.OperationalError` out of `storage.apply()` — while `_replication_loop` survives, because it only *reads*. So the node kept heartbeating, which means no follower could elect around it, with `commit_index` advancing past a `last_applied` that would never move again and every client write 504ing at `commit_timeout`. Permanently. Nothing recovered from it unaided: the cluster cannot depose a peer that is still sending AppendEntries, `/healthz` answered 200 so k8s never restarted the pod and the Service kept routing to it, and the only trace was a single `logger.error` that had already scrolled past. No adversary, no partition, no scale — one disk hiccup. Found by two independent audits of this repo, which is itself the point: it is invisible from inside the algorithm, because the algorithm is behaving correctly | `RaftNode.degraded` names the dead loop and `/healthz` answers 503 while it is set, so the node fails its probe instead of silently wedging the cluster. `k8s/raftkv.yaml` gains a `livenessProbe` — readiness alone only removes it from the Service, and this state needs a *restart* — set deliberately slacker than readiness, because taking a node out of rotation is cheap and killing it costs an election. Cancellation is explicitly not degraded, since `stop()` cancels every loop. `tests/test_api.py::test_healthz_reports_503_once_a_background_loop_has_died` |
 | A healthy leader granted the pre-votes that unseated it | Found live while building PreVote, and invisible to every unit test that stubs the peers. The lease that stops a follower disturbing a working leader was written as "I know a leader AND have heard from it recently" — but a leader's own election timer is stale for its entire tenure *by design* (`_become_follower` resets it precisely because it has been), so the elapsed-time test read a perfectly healthy incumbent as one nobody had heard from. It therefore granted the straw poll of the first follower whose timer drifted, that follower won its poll on the incumbent's own vote, and the real election deposed it. A mechanism whose entire purpose is preventing needless elections was causing them — and only in a three-node cluster over real timers, which is why it took a live test to see | A leader holds the lease unconditionally: `_check_quorum` is the sole authority on when a leadership ends. `tests/test_pre_vote.py::test_a_leader_refuses_every_poll_for_as_long_as_it_leads` |
+| A candidate's own campaign renewed the lease it used to refuse other candidates | The sibling of the row above, and the same root cause read the other way round. The lease is documented &mdash; in `_handle_pre_vote` and in its own tests &mdash; as "this node has heard from its leader inside one `election_timeout_min`". It read `_last_reset`, the election timer, which THREE different events legitimately advance: hearing from the leader, granting a vote, and **starting an election of our own** (`_start_election` resets before it polls, deliberately, so a failed poll costs a full timeout). Read as a lease, that last one is a node citing its own campaign as evidence that the leader is alive, so every follower that had just campaigned refused the follower that campaigned next and they suppressed one another for as long as they both kept trying. Measured on the live four-voter demo cluster by killing the leader and probing a survivor with `POST /raft/request-vote` every 250 ms for 30 s &mdash; a pre-vote binds nothing, so the probe cannot perturb what it measures: with **no leader contact at all** in the window, 109 of 109 polls sent within 4 s of that node's own campaign were refused and 36 of 50 sent outside it were granted. The flip is exactly its own `election_timeout_min`. An EVEN voter set is what made it visible rather than merely slow: a candidate there needs two grants instead of one, so the chance of catching every peer outside its own self-renewed lease in the same round is squared. **Re-measured after the fix, same protocol and same 4 s window: 92 of 92 granted inside the node's own campaign window, against 0 of 109 before.** A dead leader is now replaced in one election timeout &mdash; 5.0 s at three voters, 4.7 s at four, 4.0 s at five &mdash; where the original observation was ~45 s | A separate `_last_heard_from_leader`, written only by an AppendEntries from the current leader, is what the lease reads; `_last_reset` keeps answering the only question it can answer, which is when this node's own timer should next fire. `tests/test_pre_vote.py::test_our_own_campaign_does_not_renew_the_lease_we_refuse_others_with`, `tests/test_election_quorum_by_size.py`, and two new `scripts/mutate.py` entries |
 | `/admin/flood` raised `NameError` on every call | `FloodRunner` was imported but never constructed. The feature had no test, so nothing said so | Constructed in `create_app()` and cancelled on shutdown. `tests/test_flood_endpoint.py` |
 | One failed write abandoned the whole flood, and the panel called it green | The generator's per-write `try` caught only `NotLeaderError` and `TimeoutError`, and `asyncio.gather` propagates the first exception while abandoning every task queued behind it. So one unexpected error — a SQLite `database is locked` under contention being the realistic one — stranded `done` below `total` permanently. Worse, the dashboard tinted by `timeout \|\| not_leader`, both of which were zero, so a burst that never ran rendered as a clean green sweep. A load generator that silently under-reports load is worse than no load generator | Every write settles into a counter and the worker raises nothing but `CancelledError`; unexpected errors land in a new `failed` count with `last_error`, `gather` takes `return_exceptions=True` as a second line of defence, and the panel tints `failed` **red** (not the amber that means "Raft under strain") and calls a short burst `INCOMPLETE`. `tests/test_flood_endpoint.py`, `tests/test_dashboard_flood.py` |
+| A re-elected leader committed an entry only it held — stale `match_index` counted by the no-op's commit scan | **The most serious kind of bug there is: State Machine Safety (§5.4.3) broken, an acknowledged write lost.** `_become_leader` reinitialized `match_index` *after* appending its no-op, and the append runs `_advance_commit_index`. So the commit scan ran against a *previous tenure's* `match_index`. This was documented for two revisions as "refuted, unreachable — requires truncating below an index a peer already acked", and the "unreachable" half was wrong. §5.4.1's term-first vote is the hole: a node still holding a leader's old prefix may legally elect a successor whose **shorter but higher-term** log conflicts with it. A leader deposed with `match_index[p]=k`, whose own log is then truncated and refilled to length `k-1` by exactly that route, appends its no-op at index `k` — matching the stale value. The scan counts those stale `k`s as replicas and commits an entry only this node holds. Reproduced end to end on a 5-voter cluster driven entirely through the node's own methods: index 512 committed on a 1-of-5 hold, 509 commands applied that the cluster never committed, and on repair the node's log truncated **below its own `commit_index`** — the exact `committed → truncated` red edge, made durable | `match_index` is zeroed **before** the no-op is appended, so the scan has nothing stale to count (etcd resets progress in `reset()` before `appendEntry` for the same reason; `next_index` carries no such hazard and stays put). `tests/test_election_flow.py::test_a_stale_match_index_at_the_noop_index_does_not_commit`, and `tests/invariants.py` now checks `LeaderAppendOnly` and per-node `commit_index`/`last_applied` monotonicity so a randomized run would catch the class, not just this instance |
+| One unauthenticated RPC diverged a node's term from disk, then killed a leader's replication loop | `AppendEntriesRequest.term` / `RequestVoteRequest.term` were unbounded `int`. SQLite stores INTEGER as signed 64-bit and its driver raises `OverflowError` past that — but `_observe_term` assigned `self.current_term = term` **before** persisting it, so a single `term = 2**63` request left the node's in-memory term one no restart would remember (a Fig. 2 violation), free to vote twice in a term. It then propagated: a legit leader read that term off the reply, tried to persist it too, and its `_append_to_peer` raised *outside* `except TransportError` → `asyncio.gather` → the replication loop died, cluster-wide, from one packet | Two independent defences. The wire refuses the value (`MAX_WIRE_INT = 2**63 - 1`, `ge=0` on every term/index field, length caps on every id — the ceiling is the database's, so the largest storable value still passes), and `_observe_term` / the vote grant / `_start_election` now persist **before** mutating memory, so any write that fails for any reason leaves memory and disk agreeing. `tests/test_wire_bounds.py` |
+| `commit_index` could move backwards on a lagging heartbeat | Fig. 2 states commitIndex "increases monotonically". Step 5 was `commit_index = min(leaderCommit, prev_log_index + len(entries))` with a guard only on the *incoming* `leaderCommit`, not the result: an empty append whose `prev_log_index` sat below `commit_index` (high `leaderCommit`, nothing verified) dropped it to `prev_log_index`, stranding `last_applied` above it. A correct leader never sends that — Leader Completeness keeps its repair walk at or above the committed prefix — but the receiver rule is reachable directly by any peer | `max(self.commit_index, min(leaderCommit, last_new_entry))` guards the result, the way etcd's `raftLog.commitTo` does. The test named `test_commit_index_never_moves_backwards` only exercised `leaderCommit < commit_index`; `tests/test_append_entries.py::test_commit_index_does_not_regress_when_a_heartbeat_verifies_less_than_it_holds` covers the branch that actually regressed |
 
 Refuted after investigation, and left alone: a learner reporting `quorum 1` with an
-empty voter set (the value is never read), a leader not stepping down on an equal-term
-AppendEntries (unreachable without a double vote, which durable voting prevents), and a
-stale `match_index` surviving `_become_leader` (requires truncating below an index a
-peer already acked).
+empty voter set (the value is never read), and a leader not stepping down on an equal-term
+AppendEntries (unreachable without a double vote, which durable voting prevents). The
+third member of this list until an audit reproduced it — a stale `match_index` surviving
+`_become_leader` — turned out to be real; it is the table row above, not a refutation. The
+lesson kept: "requires an unreachable state" is a claim a test should be made to assert,
+not a conclusion to rest on. `tests/invariants.py`'s new monotonicity checks are that
+assertion for this one.
+
+### The lease window is the RECEIVER's election timeout
+
+Worth knowing before reading a slow election as the bug above. A pre-vote is refused for
+one `election_timeout_min` **of the node being asked**, so in a cluster whose nodes are
+timed differently the slowest node is the one that decides how long an election can be
+vetoed — however fast everyone else is.
+
+`scripts/run_local.sh` ships exactly that asymmetry on purpose: nodes 2 and 3 run
+`RAFT_ELECTION_MIN=4`, node-1 runs the defaults, so the debugger node wins every election
+it contests. The abandoned first cut of that layout stretched **node-1** instead
+(60–120 s), and its own comment records why it was dropped. A node-1 still running those
+values is a voter that withholds every pre-vote grant for a full minute after its leader
+dies, which reads as a consensus bug and is a stale environment. `POST /admin/timing` on
+each node reports what it is actually running, which is the fastest way to tell the two
+apart.
+
+`POST /admin/timing` changes a node's in-memory config, not its environment, and
+`provision._child_env` copies `os.environ` — so a node **provisioned** by a node whose
+timing was adjusted live still inherits the *environment's* values, not the running ones.
+Retuning a leader and then growing the cluster from it therefore hands the newcomer the
+timing you thought you had replaced. This bit the live 4-voter run above: node-4 came up
+with a 60 s lease inherited from node-1's shell, vetoed every pre-vote for a minute, and
+looked exactly like the bug that had just been fixed. Pin the newcomer's timing explicitly
+after provisioning, or provision from a node whose environment is already right.
 
 ## Two leaders on the dashboard
 
@@ -85,6 +119,47 @@ so a full mesh would be a lie`), so it re-centres on the new leader when leaders
 An edge appearing between two nodes after a heal is that re-centring, not a new network
 path — the link was always there; it was only ever drawn from whichever node was leading.
 
+## The two edges the dashboard watches for
+
+Each node card draws three state machines — role (one per node), ballot (one per term),
+log (one per index). Two of the three are defined as much by an edge they must *never*
+have as by the ones they do, and both of those absences are safety properties, so the
+panel flags them in red rather than only drawing them:
+
+| Edge that must not exist | What it would mean | Where it is checked |
+|---|---|---|
+| **ballot: spent → differently spent** — two grants to different candidates inside one term | Election Safety at its source. `voted_for` is durable and write-once per term (Fig. 2 rule 6), and two leaders in one term requires some voter to have taken this edge | `ballotTransitions`, per node, from `vote_granted` and `election_started` |
+| **log: committed → truncated** — a cut at or below a committed index | State Machine Safety. That entry was acknowledged by a majority and a client may have been told about it | `logTransitions`, per node, from `log_truncated` against a running committed watermark |
+
+This is deliberately *upstream* of the "two leaders" reading above. The `leaderEntry()`
+logic sees two leaders after the fact and correctly reports that it is legal; the ballot
+check sees the vote that would make it illegal, on the one node that cast it, at the time.
+
+Three honest limits, none of which the panel hides:
+
+- **`/logs` is a bounded ring buffer.** An old double vote scrolls out of reach. The
+  checks catch what is still retained, which on a demo cluster is the recent past — and
+  the empty case says "in the retained log" rather than claiming nothing happened.
+- **A follower never logs `commit_advanced`.** `handle_append_entries` moves `commit_index`
+  from `leader_commit` without an event, deliberately: it moves on essentially every
+  append round, and logging it would bury the feed. So `applied` is a follower's only
+  evidence of commitment, and the watermark takes the max of both. Without that the
+  truncation check would be dead on every node except the leader, which is where log
+  divergence is *least* likely.
+- **`reset` drops the watermark, and must.** An operator destroying a log is not Raft
+  violating itself; leaving the watermark standing would fire the alarm on the first
+  ordinary §5.3 conflict during the refill, on a documented operation.
+
+The three watermarks the log panel shows — `last_log_index`, `commit_index`,
+`last_applied` — are also checked against each other straight from `/state`, which holds
+whether or not the ring buffer still has the events. `last_applied <= commit_index <=
+last_log_index` at every instant; a card showing otherwise is showing a broken node.
+
+Pinned by `tests/test_dashboard_state_machines.py`, and by six `scripts/mutate.py` entries
+that break each check in turn — a detector nothing tests is a green light wired to
+nothing.
+
+
 ## Table 2 — deliberate omissions
 
 Each was cut on purpose, with eyes open. "§" cites the Raft paper; "thesis" is Ongaro's
@@ -93,9 +168,10 @@ dissertation.
 | Omission | What breaks without it at scale | The production fix |
 |---|---|---|
 | Log compaction / snapshots (§7) | The log grows without bound: disk fills, restart replay time grows linearly forever | Snapshot the state machine at an index, discard the log prefix, ship snapshots to lagging peers via the InstallSnapshot RPC |
-| Linearizable reads (§8) | Follower reads can be stale, and so can leader reads. CheckQuorum now bounds the *duration* — a leader that reaches no majority resigns within one election timeout instead of serving reads it no longer owns for the length of the partition — but bounded is not linearizable. Inside that window a partitioned leader still answers from a state machine the cluster has moved past, and a leader that legitimately holds quorum still has no proof at the moment of the read that it has not just been deposed | ReadIndex: on a read, record `commit_index`, confirm leadership with one round of heartbeats, then answer once `last_applied` reaches it. Leader leases are the faster variant and buy latency at the cost of a clock assumption. CheckQuorum is the precondition for both, and it is what shipped first |
+| Linearizable reads (§8) | Follower reads can be stale, and so can leader reads. CheckQuorum bounds how long a partitioned node keeps *calling itself* leader — it resigns within one election timeout — but it does **not** touch the read path: `GET /kv/{key}` never consults role, term, or lease (`app.py`), so resignation changes only the `role` string in the response body, not what value is returned. A partitioned node serves the same stale read before and after it steps down; CheckQuorum shortens the window in which that read is *labelled* authoritative, not the window in which it is *served*. Bounded staleness is still not linearizability either way | ReadIndex: on a read, record `commit_index`, confirm leadership with one round of heartbeats, then answer once `last_applied` reaches it — and gate the read on being leader in the first place. Leader leases are the faster variant and buy latency at the cost of a clock assumption. CheckQuorum is the precondition for both, and it is what shipped first |
 | Client sessions for exactly-once (§8) | A client that retries a timed-out write can apply it twice (at-least-once today; `request_id` is minted server-side and only detects a log index reused by a different leader, so it cannot dedupe a retry even in principle). **"Applied twice" understates it under concurrency: the retry is a lost update.** A writes `balance=100`, the 200 is lost; B writes `balance=200` and is acknowledged; A's retry lands at a later index and reverts it to 100 — B's *acknowledged* write is gone, with no partition and no crash | Client sessions with per-client serial numbers; the state machine deduplicates inside the same transaction as the apply. Accepting a client-supplied id is the easy half; session expiry is the hard half |
 | TLS/mTLS between nodes | RPCs cross the network in plaintext: any on-path attacker can read or forge votes and entries; medical-grade deployments would require encryption in transit | mTLS between peers (SPIFFE/cert-manager identities), TLS on the client API |
+| Voter removal / demotion (§6, thesis §4.2.2) | Membership only grows: `add_learner` and `promote_learner` are the whole surface. A voter that dies permanently can never be replaced — it inflates every quorum it will never help satisfy, so a 5-voter cluster that loses two machines for good is one failure from unavailability, forever. The removal arm of `promote_learner`'s one-at-a-time check is dead code, and thesis §4.2.2's rule (a leader removed by C-new steps down only after committing it) has no code path to apply to | The same joint-consensus machinery run in the other direction: C-old,new with the departing voter only in C-old, then C-new without it. The two extra rules it drags in are the reason it was cut: the deposed-leader step-down above, and §4.2.3's disruptive-server defence — a removed server that no longer receives heartbeats will campaign against the cluster it was removed from, which is what the PreVote lease on *real* votes (etcd's `inLease` check) exists to absorb |
 | Flow control on the write path | Past ~1000 concurrent client writes the leader loses its term and the whole burst reports `commit_timeout` — measured below. The same volume sent in smaller batches is fine, so it is concurrency the server has no way to refuse. The one piece of this that *is* implemented is the outbound half: the `AppendEntries` payload is capped (table 1b). Nothing caps what comes *in* | Batch client commands into one append and one fsync, so N concurrent writes cost one durable write rather than N; apply backpressure at the API — a bounded submit queue, or a 429 — rather than accepting unbounded concurrent submits and discovering the limit as a lost election |
 
 ## Repairing a far-behind follower, measured

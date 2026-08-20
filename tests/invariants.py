@@ -69,7 +69,24 @@ class RaftInvariantMonitor:
         # node_id -> {index: term} for every index that node has ever held, so a later
         # truncation of a *committed* index is visible even after the log looks tidy again.
         self.committed_entry: dict[int, tuple[int, object]] = {}
+        # The log each node held the last time it was observed AS LEADER, keyed by
+        # (incarnation, term) — see _leader_append_only for why the term belongs in the key.
+        self.leader_log: dict[tuple[int, int], list[tuple[int, object]]] = {}
+        # Per-incarnation volatile watermarks, for the monotonicity checks.
+        self.watermarks: dict[int, tuple[int, int, int]] = {}
         self.observations = 0
+
+    @staticmethod
+    def _incarnation(node) -> int:
+        """Identity of one RUN of a node, not of the node.
+
+        `SimCluster.restart()` builds a FRESH RaftNode on the same database file, and a
+        restart legitimately moves volatile state BACKWARDS: `commit_index` is rebuilt
+        from `last_applied`, so a node that had committed to 10 and applied to 7 restarts
+        at 7. Keying the watermarks on `id(node)` scopes them to one incarnation, which is
+        the only span over which "never decreases" is a real rule rather than a
+        misunderstanding of what a restart is."""
+        return id(node)
 
     def observe(self, cluster) -> None:
         live = [n for n in cluster.nodes.values() if _readable(n)]
@@ -81,6 +98,8 @@ class RaftInvariantMonitor:
         self._log_matching(logs)
         self._state_machine_safety(live, logs)
         self._leader_completeness(live, logs)
+        self._leader_append_only(live, logs)
+        self._local_monotonicity(live, logs)
 
     # --- the five properties -------------------------------------------------------
 
@@ -193,6 +212,113 @@ class RaftInvariantMonitor:
                         f"{node.cfg.node_id} of term {node.current_term} holds "
                         f"{log[idx - 1]!r}. An acknowledged write was overwritten."
                     )
+
+    def _leader_append_only(self, live, logs) -> None:
+        """A leader never overwrites or deletes entries in its own log; it only appends
+        (§5.3, Figure 3). The fifth property — described in this module's docstring since
+        it was written, and until now not actually checked.
+
+        It is temporal, and that is the whole difficulty: a log that truncated an entry and
+        re-appended an identical one looks untouched in any single snapshot. So the
+        previous log is kept and the current one must EXTEND it — same entries at every
+        index they share, and no shorter.
+
+        Keyed by `(incarnation, term)` rather than by node. A node may legally hold a
+        different log at index 5 across two different tenures: it is deposed, a new leader
+        truncates its divergent tail, and it is elected again later. Only within ONE term
+        is a leader's log strictly append-only, because within one term there is only one
+        leader (Election Safety) and nobody else can be telling it to truncate. Checking it
+        across terms reports the ordinary repair of a deposed leader as a violation.
+
+        The bug this catches is a leader that truncates its OWN log — which the receiver
+        rules make possible, because `handle_append_entries` truncates on conflict and a
+        leader that failed to step down first would run those rules while still LEADER.
+        Rule 4 (§5.1) is what prevents it: a higher term deposes us BEFORE the handler's
+        own logic. Weaken `_observe_term`, or move the role change after the truncation,
+        and this is what notices.
+        """
+        for node in live:
+            if node.role is not Role.LEADER:
+                continue
+            key = (self._incarnation(node), node.current_term)
+            log = logs[node.cfg.node_id]
+            previous = self.leader_log.get(key)
+            if previous is not None:
+                if len(log) < len(previous):
+                    raise InvariantViolation(
+                        f"LeaderAppendOnly: leader {node.cfg.node_id} of term "
+                        f"{node.current_term} went from {len(previous)} entries to "
+                        f"{len(log)}. A leader deleted entries from its own log."
+                    )
+                if log[: len(previous)] != previous:
+                    differ = next(
+                        i for i, (a, b) in enumerate(zip(previous, log, strict=False))
+                        if a != b
+                    )
+                    raise InvariantViolation(
+                        f"LeaderAppendOnly: leader {node.cfg.node_id} of term "
+                        f"{node.current_term} changed index {differ + 1} from "
+                        f"{previous[differ]!r} to {log[differ]!r}. A leader overwrote its "
+                        "own log."
+                    )
+            self.leader_log[key] = log
+
+    # --- per-node monotonicity ------------------------------------------------------
+
+    def _local_monotonicity(self, live, logs) -> None:
+        """What must never run backwards ON ONE NODE, within one run of it.
+
+        None of the five properties above is local: they all compare nodes to each other,
+        so a node that corrupts its own state in a way the others happen to mirror slips
+        through every one of them. These are the cheap local checks that close that gap,
+        and each names a real bug class:
+
+          * **currentTerm decreasing** — terms are the algorithm's logical clock and Figure
+            2 only ever raises them. A node that lowered its term could vote a second time
+            in a term it had already voted in, which is two leaders in one term.
+          * **commitIndex decreasing** — a committed index is decided forever. Moving it
+            back means the node is prepared to commit something ELSE there.
+          * **lastApplied decreasing** — the state machine would replay an index, applying
+            two different commands at one position.
+          * **lastApplied > commitIndex** — applying what was never committed: the entry
+            can still be truncated, and the state machine cannot un-apply it.
+          * **commitIndex > lastLogIndex** — the node claims to have committed an entry it
+            does not hold. This is the one that catches a follower truncating below its own
+            commit index, which no cross-node property necessarily sees: if every surviving
+            node truncated consistently, the logs still match each other.
+
+        Scoped per INCARNATION (see `_incarnation`): a restart rebuilds `commit_index` from
+        `last_applied` and may legitimately move it backwards.
+        """
+        for node in live:
+            key = self._incarnation(node)
+            term, commit, applied = node.current_term, node.commit_index, node.last_applied
+            nid = node.cfg.node_id
+
+            if applied > commit:
+                raise InvariantViolation(
+                    f"{nid} has last_applied={applied} above commit_index={commit}. It "
+                    "applied an entry that was never committed."
+                )
+            if commit > len(logs[nid]):
+                raise InvariantViolation(
+                    f"{nid} has commit_index={commit} but only {len(logs[nid])} entries. "
+                    "It committed an index it does not hold — a log was truncated below "
+                    "its own commit index."
+                )
+            seen = self.watermarks.get(key)
+            if seen is not None:
+                for name, was, now in (
+                    ("current_term", seen[0], term),
+                    ("commit_index", seen[1], commit),
+                    ("last_applied", seen[2], applied),
+                ):
+                    if now < was:
+                        raise InvariantViolation(
+                            f"{nid} moved {name} BACKWARDS, {was} -> {now}, without "
+                            "restarting. Nothing in Figure 2 lowers it."
+                        )
+            self.watermarks[key] = (term, commit, applied)
 
 
 def assert_no_acknowledged_write_is_lost(cluster, acknowledged: dict[str, str]) -> None:

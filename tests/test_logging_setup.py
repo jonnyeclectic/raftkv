@@ -11,7 +11,7 @@ from raftkv.logging_setup import JsonFormatter, RingBufferHandler, log_event, se
 def fresh_logging():
     """setup_logging is idempotent per process, so another module (e.g. test_api)
     may have installed handlers first. Isolate this module: clear the raftkv
-    logger's handlers, restore whatever was there afterwards.
+    logger's handlers, restore whatever was there afterward.
 
     propagate must be saved/restored too: setup_logging sets it False, and
     pytest's log capture attaches its own handlers to every non-propagating

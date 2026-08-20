@@ -110,6 +110,33 @@ them per node, and the SYSTEM panel reads `MIXED (n)` when nodes disagree — a 
 running two builds behaves like Raft misbehaving, and nothing else on the page shows it.
 Per-node builds are under each card's **infrastructure** section.
 
+Each card opens three state machines, because a node is running three at once at three
+different scopes &mdash; **role** (one per node), **ballot** (one per term), and **log**
+(one per index). Each draws its states as boxes with the current one lit, highlights the
+edge the node last took, and names what caused it.
+
+They are lit from `/state` and *edged* from that node's own `/logs`, never sampled by
+watching values change between polls: a 500 ms poll cannot see a transition shorter than
+500 ms, and follower → candidate → leader inside one tick is exactly what an uncontested
+election looks like.
+
+- **role** &mdash; follower / candidate / leader. Separates the three different things
+  `became_follower` can mean: a leader that lost contact with a majority (CheckQuorum), a
+  leader that met a newer term, and a candidate that met a live leader.
+- **ballot** &mdash; where this term's single vote went. `voted_for` is durable and
+  write-once per term, so the automaton has *no* edge from one spent state to a
+  differently-spent one; that missing edge is Figure 2 rule 6. Two grants to different
+  candidates inside one term is flagged in red, upstream of the Election Safety counter,
+  which can only ever see the two leaders afterwards.
+- **log** &mdash; `appended → committed → applied`, carrying the three watermarks that
+  place every index in exactly one stage, plus the backlog at each gap. Truncation is the
+  one edge back out, and only from `appended`: a cut at or below a committed index is
+  flagged, because that is State Machine Safety breaking.
+
+A lost straw poll is a **self-loop** on both role and ballot &mdash; a node that would lose
+never runs, never touches its term and never spends its vote, which is the whole content
+of PreVote.
+
 ## Repo map
 
 | Path | Responsibility |
@@ -150,6 +177,7 @@ Per-node builds are under each card's **infrastructure** section.
 | `tests/test_replication.py` | Leader side: matchIndex discipline, commit rule, stale-reply guards |
 | `tests/test_pre_vote.py` | The straw poll (thesis §9.6): what a pre-vote must NOT cost the receiver &mdash; no term bump, no persisted vote, no timer reset &mdash; the lease that protects a healthy leader, and `/admin/campaign` bypassing the whole round |
 | `tests/test_check_quorum.py` | A leader resigning on its own silence (thesis §6.2): the majority arithmetic including both halves of a joint configuration, what counts as contact, and the seed that stops a fresh leader deposing itself |
+| `tests/test_election_quorum_by_size.py` | The election threshold at each cluster size, 3 &rarr; 4 &rarr; 5. Four voters is the only size where `floor(N/2)+1` and `ceil(N/2)` disagree: two of four is not a majority and a 2&ndash;2 partition elects nobody on either side. Five voters elect and still commit after two failures, and two of five cannot elect at all. Every threshold here was also walked against a live cluster through the dashboard |
 | `tests/test_simulation.py` | Real timers over a simulated network: partition, failover, divergence, restart |
 | `tests/test_api.py` | HTTP contract: KV round-trip, 503 + leader hint, structured errors, `/logs` redaction |
 | `tests/test_admin_failure.py` | Dashboard kill/revive: a crashed node refuses everything, recovery reloads from disk |
@@ -168,10 +196,14 @@ Per-node builds are under each card's **infrastructure** section.
 | `tests/test_dashboard_discover.py` | The discovery tick against a stubbed, deliberately out-of-order network: cards are ordered by the probe list rather than by who answered first, and no address is ever adopted twice |
 | `tests/test_dashboard_flood.py` | The flood panel's wording and tint, run under node: failures are named and go amber even when the run completed, and a cancelled flood never reads as done |
 | `tests/test_dashboard_keys.py` | The state machine's key display, run under node: numeric runs sort as numbers (`k8` before `k79` before `k80`), and a scroll position survives the 500 ms card rebuild |
+| `tests/test_dashboard_role_automaton.py` | The per-node role automaton, run under node: role changes reconstructed from the node's own event log rather than sampled from `role` at 2 Hz, because the interesting transitions are shorter than the poll. Pins the three things a plausible-looking diagram gets wrong &mdash; a lost straw poll is a self-loop and never a candidacy (PreVote's whole claim), a CheckQuorum resignation is distinguished from a leader that merely met a newer term, and `became_follower` carries the role being *left* |
+| `tests/test_dashboard_state_machines.py` | The ballot and log automata, run under node. **Ballot** (one per term): a straw poll loops wherever the ballot already stands rather than being pinned under *no vote*, a term change clears a spent vote, a re-grant to the same candidate is a retry and not a conflict, and two different candidates in one term is flagged &mdash; that is Figure 2 rule 6. **Log** (one per index): `appended → committed → applied` with the watermarks read from `/state`, and the truncation check, boundary included &mdash; a follower never logs `commit_advanced`, so `applied` has to serve as its proof of commitment, and an operator `reset` has to drop the watermark or the refill trips the alarm on a documented operation. Also pins the panels **as drawn**, against a minimal DOM &mdash; which box is lit, which edge is lit, both backlog numbers, and that a violation actually reaches the card in red rather than being computed into a variable nobody appends |
 | `tests/test_build_stamp.py` | Build stamps: `ui` tracks the file per request, `srv` stays frozen at import, injection leaves no placeholder, and a mixed-build cluster is named |
 | `tests/test_log_repair.py` | Accelerated §5.3 backtracking: the conflict hint is advice and every jump still lands on an ordinary consistency check, and the 6224 round trips (~52 min) a wiped follower used to need collapse to two |
 | `tests/test_gap_repair.py` | The two ways to fall behind, which cost wildly different amounts: a strict prefix rejoins in one round trip with or without the hint, while a wiped log is the regime that actually exercises the repair walk |
 | `tests/test_append_batching.py` | The AppendEntries batch cap and the re-fire that pays for it — either half alone is worse than neither, so both are pinned here |
+| `tests/test_wire_bounds.py` | The two unauthenticated RPC endpoints as a trust boundary: every term/index field is bounded to what SQLite can store and every id has a length cap, so a value that would diverge the in-memory term from disk is refused before any rule runs; and `_observe_term`/the vote grant persist before mutating memory, so a failed write leaves the two agreeing |
+| `tests/test_invariant_monitor.py` | The safety monitor watched in turn: each of `RaftInvariantMonitor`'s checks is handed a deliberately-broken fake cluster and asserted to fire, and a restart (a fresh object with a lower `commit_index`) is asserted *not* to fire — the false positive that would make the monitor unusable on the failure suite |
 | `tests/test_commit_scan.py` | The sparse commit scan: same index the exhaustive walk would commit, without the O(N²) `term_at()` cost a burst used to pay — checked against the old walk as an oracle over both hand-picked and Hypothesis-generated logs |
 | `tests/test_config_lookup.py` | `last_config()` stays on the partial index, because it is on the write path and unindexed it scanned 2.475 ms against 15,000 entries |
 | `tests/test_dashboard_voters.py` | The per-card "N voting" summary, run under node: counted from the configuration rather than the transport peer map, so a learner no longer counts itself |
