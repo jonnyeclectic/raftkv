@@ -278,9 +278,10 @@ def test_the_failure_survives_a_cross_origin_tab(page, tmp_path):
 
 
 def test_disabled_provisioning_reads_as_policy_not_not_found(page, tmp_path):
-    """Fix 2's browser face: k8s pods now ship RAFT_PROVISION_ENABLED=0, so the route
-    is not mounted and the press comes back 404 — which the page must present as the
-    deployment decision it is, naming the flag, not as FastAPI's stock 'Not Found'."""
+    """Fix 2's browser face: a deployment that turns provisioning off entirely
+    (RAFT_PROVISION_ENABLED=0) never mounts the route, so the press comes back 404 —
+    which the page must present as the deployment decision it is, naming the flag,
+    not as FastAPI's stock 'Not Found'."""
     with raftkv_node(tmp_path, env_extra={"RAFT_PROVISION_ENABLED": "0"}) as addr:
         status, resp = press_provision(page, addr)
     assert resp.status == 404
