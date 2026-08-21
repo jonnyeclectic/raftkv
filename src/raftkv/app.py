@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, ValidationError
 from raftkv.build import SERVER_BUILD, ui_build
 from raftkv.config import NodeConfig
 from raftkv.flood import MAX_CONCURRENCY, MAX_TOTAL, FloodBusyError, FloodRunner
+from raftkv.k8s_provision import scale_up as k8s_scale_up
 from raftkv.logging_setup import RingBufferHandler, log_event, setup_logging
 from raftkv.models import (
     AppendEntriesRequest,
@@ -131,7 +132,17 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
     async def unhandled(request: Request, exc: Exception) -> JSONResponse:
         # anything unexpected still flows through the JSON logging pipeline
         log_event(logger, "unhandled_exception", path=request.url.path, error=repr(exc))
-        return JSONResponse(status_code=500, content={"error": "internal"})
+        # Starlette sends this handler's response from ServerErrorMiddleware, which sits
+        # OUTSIDE the CORSMiddleware above -- so without this header a cross-origin
+        # dashboard tab cannot read the 500 at all and reports the whole exchange as
+        # `TypeError: Failed to fetch` (observed live: the k8s provision failure was
+        # invisible for exactly this reason; docs/FAILURE_MODES.md). `*` restates the
+        # policy already declared above, and no endpoint uses credentials.
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal"},
+            headers={"access-control-allow-origin": "*"},
+        )
 
     def refuse_if_crashed() -> None:
         """A crashed node answers nothing except /admin/recover and the dashboard —
@@ -328,14 +339,26 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
                 409 rather than 500 on refusal: every reason this declines -- running
                 inside a container, the cap reached, the port taken -- is a statement
                 about the environment that the operator can act on, not a bug.
+
+                Two backends, one route, same contract (a staged node in nobody's
+                configuration): RAFT_PROVISION_K8S=1 swaps the subprocess spawn for a
+                StatefulSet scale-up through the Kubernetes API. The dashboard cannot
+                tell them apart, which is the point -- 'provision node' means the same
+                thing on every deployment, and each backend refuses to run in the
+                other's environment (see k8s_provision.py).
                 """
                 refuse_if_crashed()
                 try:
-                    result = await spawn(
-                        body.ordinal,
-                        max_nodes=cfg.provision_max_nodes,
-                        log_dir=cfg.log_dir,
-                    )
+                    if cfg.provision_k8s:
+                        result = await k8s_scale_up(
+                            body.ordinal, max_nodes=cfg.provision_max_nodes
+                        )
+                    else:
+                        result = await spawn(
+                            body.ordinal,
+                            max_nodes=cfg.provision_max_nodes,
+                            log_dir=cfg.log_dir,
+                        )
                 except ProvisionError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 return result
@@ -379,7 +402,12 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz() -> dict:
-        refuse_if_crashed()  # compose/k8s probes see the failure too
+        # Readiness, not liveness: compose's healthcheck and the k8s readinessProbe
+        # read this, so a killed node drops out of the Service and looks down to the
+        # demo. The kubelet's livenessProbe reads /livez instead — pointed here, it
+        # restarted the container ~30s after the dashboard's kill button, and the
+        # fresh process forgot it was crashed.
+        refuse_if_crashed()
         # A node with a dead background loop is the worst state a consensus member can be
         # in, and until this check it was the only one that looked healthy. `_apply_loop`
         # dies on a single storage error; `_replication_loop` survives, because it only
@@ -391,6 +419,35 @@ def create_app(cfg: NodeConfig | None = None) -> FastAPI:
         if dead:
             raise HTTPException(status_code=503, detail=f"background task died: {dead}")
         return {"ok": True, "node": cfg.node_id}
+
+    @app.get("/livez")
+    async def livez() -> dict:
+        """Liveness for the kubelet, and nothing else: is this process beyond
+        self-repair? Distinct from /healthz ("should this node be treated as
+        serving?") because the two probes act differently on failure — readiness
+        removes the node from the Service, which is cheap and reversible; liveness
+        RESTARTS the container.
+
+        A simulated crash must pass here. crash() stops the background tasks on
+        purpose and /admin/recover restarts them, so a killed node is exactly as
+        self-repairable as it is meant to be — and the degraded check must not run
+        while crashed, because it would be reading tasks that were stopped
+        deliberately. When liveness read /healthz, the kubelet restarted a killed
+        pod after three failed probes (~30s) and the fresh process booted with
+        crashed=False: the kill button un-killed itself with no admin action.
+        A REAL dead process still fails this probe the honest way, by refusing
+        the connection — only the simulated crash is exempted.
+
+        A dead background loop is the state liveness exists for (see degraded):
+        the node keeps heartbeating so no follower can elect around it, and nothing
+        inside the process can restart the loop. 503 here is what asks the kubelet
+        for the restart."""
+        if node.crashed:
+            return {"ok": True, "node": cfg.node_id, "crashed": True}
+        dead = node.degraded
+        if dead:
+            raise HTTPException(status_code=503, detail=f"background task died: {dead}")
+        return {"ok": True, "node": cfg.node_id, "crashed": False}
 
     @app.get("/build")
     async def build() -> dict:

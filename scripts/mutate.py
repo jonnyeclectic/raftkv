@@ -33,6 +33,30 @@ MUTATIONS = [
     ("empty voter set counts as agreement", "raft.py",
      "        if not self.config.voters:\n            return False",
      "        if not self.config.voters:\n            return True"),
+    # floor(N/2)+1 -> ceil(N/2). IDENTICAL for every odd N: at three voters both give two,
+    # so no three-node test can tell them apart. At four they give three and two, and two
+    # of four is exactly half -- both halves of a 2-2 split would hold a "majority" and
+    # elect a leader each.
+    #
+    # Already caught before tests/test_election_quorum_by_size.py existed, and by tests that
+    # are not about elections at all: test_commit_advances_only_as_far_as_a_majority_holds,
+    # test_promote_endpoint_round_trip and test_an_undialable_voter_does_not_kill_the_
+    # election_loop all reach four voters incidentally, on the commit and membership paths.
+    # That is coverage by luck rather than by intent -- it would evaporate the day those
+    # tests were rewritten at three nodes -- which is what the named even-N election tests
+    # are for. Kept here as a mutation because "which test catches this" should be a
+    # question with an answer.
+    ("majority: floor(N/2)+1 -> ceil(N/2)  [only wrong for EVEN N]", "raft.py",
+     "return len(acked & voters.keys()) >= len(voters) // 2 + 1",
+     "return len(acked & voters.keys()) >= (len(voters) + 1) // 2"),
+    ("quorum: floor(N/2)+1 -> ceil(N/2)  [reported number only]", "raft.py",
+     "return len(self.config.voters) // 2 + 1",
+     "return (len(self.config.voters) + 1) // 2"),
+    # Half counts as a majority. Unlike the ceil swap above this is wrong at EVERY size,
+    # odd included: 2 of 5 would elect, and so would the other 3, in the same term.
+    ("majority: >= half+1 -> >= half  [half counts as a majority]", "raft.py",
+     "return len(acked & voters.keys()) >= len(voters) // 2 + 1",
+     "return len(acked & voters.keys()) >= len(voters) // 2"),
 
     # ---- Figure 8 / commit rule ----
     ("commit: drop the current-term restriction", "raft.py",
@@ -50,8 +74,15 @@ MUTATIONS = [
      "        if self.storage.term_at(req.prev_log_index) != req.prev_log_term:\n            return self._consistency_failure(req.prev_log_index)",
      "        if False:\n            return self._consistency_failure(req.prev_log_index)"),
     ("leaderCommit: trust it beyond what we verified", "raft.py",
-     "            self.commit_index = min(req.leader_commit, last_new_entry)",
-     "            self.commit_index = req.leader_commit"),
+     "            self.commit_index = max(self.commit_index, min(req.leader_commit, last_new_entry))",
+     "            self.commit_index = max(self.commit_index, req.leader_commit)"),
+    # Drop the monotonicity guard on the RESULT — the pre-fix code. A heartbeat whose
+    # prev_log_index sits below commit_index (empty entries, high leaderCommit) then drops
+    # commit_index backwards, stranding last_applied above it. Fig. 2 says commitIndex only
+    # increases; etcd's commitTo guards the same way. See FAILURE_MODES.md table 1c.
+    ("commit: monotonicity guard on the result removed", "raft.py",
+     "            self.commit_index = max(self.commit_index, min(req.leader_commit, last_new_entry))",
+     "            self.commit_index = min(req.leader_commit, last_new_entry)"),
 
     # ---- matchIndex discipline (Students' Guide) ----
     ("matchIndex from our log, not what we sent", "raft.py",
@@ -65,8 +96,31 @@ MUTATIONS = [
 
     # ---- persistence before reply (Fig 2 §5.2) ----
     ("vote not persisted before replying", "raft.py",
-     "        self.storage.save_term_and_vote(self.current_term, req.candidate_id)  # rule 1",
+     "        self.storage.save_term_and_vote(self.current_term, req.candidate_id)  # rule 1: disk first",
      "        pass  # MUTANT: vote not persisted"),
+    # Mutate the ORDER, not the presence: adopt the higher term in memory BEFORE persisting
+    # it. The write still happens, so a healthy node looks fine — but a write that raises
+    # (a value SQLite cannot hold arrives on the unauthenticated port) now leaves the term
+    # in memory and not on disk, free to vote twice after a restart. test_wire_bounds.py's
+    # persist-ordering tests drive a failing write and assert memory and disk still agree.
+    ("observe_term: mutate memory before persisting", "raft.py",
+     "            self.storage.save_term_and_vote(term, None)  # rule 1: persist first, literally\n            self.current_term = term\n            self.voted_for = None",
+     "            self.current_term = term\n            self.voted_for = None\n            self.storage.save_term_and_vote(term, None)"),
+
+    # ---- re-election commit safety (§5.4.2 / §5.4.3) ----
+    # Append the no-op BEFORE resetting match_index — the State Machine Safety bug. The
+    # no-op's commit scan then counts a prior tenure's match_index; if a truncation left a
+    # stale value at exactly the no-op's index, it commits an entry only this node holds.
+    ("become_leader: no-op appended before match_index is reset", "raft.py",
+     "        self.match_index = {p: 0 for p in self._replication_targets()}\n        self._noop_index = self._leader_append(NoOp())",
+     "        self._noop_index = self._leader_append(NoOp())\n        self.match_index = {p: 0 for p in self._replication_targets()}"),
+
+    # ---- wire bounds on the unauthenticated RPC surface ----
+    # Remove the ceiling on AppendEntries.term. A term of 2**63 then reaches _observe_term,
+    # which assigns it to current_term before the SQLite write raises OverflowError.
+    ("wire: AppendEntries.term ceiling removed", "models.py",
+     "    term: int = Field(ge=0, le=MAX_WIRE_INT)\n    leader_id: str = Field(min_length=1, max_length=MAX_ID_LEN)",
+     "    term: int\n    leader_id: str = Field(min_length=1, max_length=MAX_ID_LEN)"),
 
     # ---- membership ----
     ("learners leak into the voter set", "raft.py",
@@ -159,9 +213,58 @@ MUTATIONS = [
     ("prevote: campaign routed through the poll it must bypass", "raft.py",
      "        await self._start_election(pre_vote=False)",
      "        await self._start_election()"),
+    # The bug this pair was extracted from, found live on a four-voter cluster: the lease
+    # reads the ELECTION TIMER, which a node's own campaign resets before it polls. Each
+    # candidate then cites its own campaign as proof the leader is alive and refuses every
+    # other candidate. Three of four voters up, identical logs, no leader for ~45 s.
+    ("prevote: lease reads the election timer, not leader contact", "raft.py",
+     "            and time.monotonic() - self._last_heard_from_leader\n            < self.cfg.election_timeout_min",
+     "            and time.monotonic() - self._last_reset < self.cfg.election_timeout_min"),
+    ("prevote: leader contact never recorded", "raft.py",
+     '        self._last_heard_from_leader = time.monotonic()',
+     '        pass  # MUTANT: contact not recorded'),
     ("prevote: failed poll does not back off", "raft.py",
      "            self._reset_election_timer()\n            role_before, term_before = self.role, self.current_term",
      "            pass  # MUTANT: no backoff\n            role_before, term_before = self.role, self.current_term"),
+
+    # ---- the dashboard's ballot and log automata ----
+    # These draw two of Raft's guarantees, so a bug here misteaches the guarantee to
+    # whoever is reading the panel to find out what the cluster did. Pinned by
+    # tests/test_dashboard_state_machines.py, which runs the shipped block under node.
+    ("ballot: straw poll pinned under UNVOTED instead of looping where it stands", "static/dashboard.html",
+     'rows.push({from: state, to: state, term: e.term, ts: e.ts,\n                 cause: e.event === "pre_vote_failed"',
+     'rows.push({from: "unvoted", to: "unvoted", term: e.term, ts: e.ts,\n                 cause: e.event === "pre_vote_failed"'),
+    # One vote per term (§5.2) is what makes two leaders in a term impossible. A dead check
+    # here is silent: the panel keeps drawing a perfectly ordinary ballot.
+    ("ballot: a second vote in one term is never compared", "static/dashboard.html",
+     "if (castTo !== null && castTo !== e.candidate) {",
+     "if (false) {"),
+    ("ballot: a term change does not clear that term's vote", "static/dashboard.html",
+     "      castTo = null;\n    }\n    if (e.term != null) term = e.term;",
+     "      castTo = castTo;\n    }\n    if (e.term != null) term = e.term;"),
+    # A follower never logs commit_advanced -- handle_append_entries moves commit_index
+    # silently -- so `applied` is its only evidence. Without it the truncation check below
+    # is dead on every node except the leader, which is where it matters least.
+    ("log: applied no longer proves the entry was committed", "static/dashboard.html",
+     "if (e.index != null) proven = Math.max(proven, e.index);",
+     "if (false) proven = Math.max(proven, e.index);"),
+    ("log: reset leaves the committed watermark standing", "static/dashboard.html",
+     '      proven = 0;\n      add("appended", "truncated", "log destroyed by reset", e, 0);',
+     '      add("appended", "truncated", "log destroyed by reset", e, 0);'),
+    # commit_index NAMES a committed entry, so cutting FROM that index erases it. `<` lets
+    # the single worst case through while every other case still reports correctly.
+    ("log: truncation exactly at the committed index allowed through", "static/dashboard.html",
+     "if (e.from_index != null && e.from_index <= proven) {",
+     "if (e.from_index != null && e.from_index < proven) {"),
+
+    # The two detectors above are worth nothing if the row they build is never appended:
+    # every number on the panel stays correct and the alarm simply never fires.
+    ("panel: the log's violation row is computed and dropped", "static/dashboard.html",
+     "  if (bad) wrap.append(bad);\n  return wrap;\n}\n/* --- end automaton rendering",
+     "  return wrap;\n}\n/* --- end automaton rendering"),
+    ("panel: the log automaton lights the box the BALLOT would light", "static/dashboard.html",
+     "  const now = logStage(s);\n  const {rows, violations} = logTransitions(lastLines, s.node_id);",
+     "  const now = ballotState(s.voted_for, s.node_id);\n  const {rows, violations} = logTransitions(lastLines, s.node_id);"),
 
     # ---- runtime tempo controls ----
     ("campaign: learner allowed to campaign", "raft.py",

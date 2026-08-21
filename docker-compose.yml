@@ -35,22 +35,33 @@ services:
       RAFT_ADVERTISE: raft-node-3:8000
     volumes: ["node3-data:/data", "node3-logs:/var/log/raftkv"]
     healthcheck: *hc
-  # Started but NOT a member: no peers, never campaigns, invisible to the other three
+  # Staged but NOT a member: no peers, never campaigns, invisible to the other three
   # until the dashboard's "add node" attaches it as a learner. RAFT_ADVERTISE is what
   # the leader dials — the published 8004 only exists for the browser.
   #
-  # DECLARED HERE rather than provisioned on demand, which is what run-local now does
+  # DECLARED HERE rather than provisioned on demand, which is what run-local does
   # (the dashboard's `provision node` button, POST /admin/spawn-node). A container cannot
   # spawn its own siblings: a child started inside raft-node-1 gets raft-node-1's network
   # namespace, so the address it advertises resolves — for every peer that dials it — to
   # that peer's own loopback. The attach succeeds and replication never connects, which
   # reads as a Raft bug and is a topology mistake. provision.py refuses to run in a
-  # container for exactly that reason, so this runtime ships the two nodes instead.
+  # container for exactly that reason, so on this runtime growing is compose's job.
   #
-  # Growing a compose cluster past node-5 is a service block plus two volumes, then
-  # `docker compose up -d raft-node-6` — deliberately a file edit, because each node needs
-  # a unique id, port and volume pair that `--scale` cannot produce.
+  # DORMANT until asked for, via the profile below. Without it, `make demo` (a plain
+  # `up -d`) started all five services, so the staged row began pre-populated — the other
+  # two runtimes start exactly the bootstrap three — and the growth verb provision.py's
+  # refusal advertised was a silent no-op for nodes 4/5 (already running) and an error
+  # past them. With the profile, `docker compose up -d raft-node-4` IS the compose growth
+  # verb: naming a profiled service activates its profile implicitly (Compose v2.20+),
+  # and the node comes up staged (learner, no peers) on a port (8004/8005) the dashboard
+  # already probes, so it appears in the staged row with no further wiring.
+  #
+  # Growing a compose cluster past node-5 is a service block (carrying this same profile,
+  # or `make demo` starts it) plus two volumes, then the same `docker compose up -d
+  # raft-node-6` — deliberately a file edit, because each node needs a unique id, port
+  # and volume pair that `--scale` cannot produce.
   raft-node-4:
+    profiles: ["staged"]
     build: .
     ports: ["8004:8000"]
     environment:
@@ -60,6 +71,7 @@ services:
     volumes: ["node4-data:/data", "node4-logs:/var/log/raftkv"]
     healthcheck: *hc
   raft-node-5:
+    profiles: ["staged"]
     build: .
     ports: ["8005:8000"]
     environment:
