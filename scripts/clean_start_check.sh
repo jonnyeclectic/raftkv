@@ -6,7 +6,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 echo "== clean start: removing containers, volumes, local images =="
-docker compose down --volumes --remove-orphans --rmi local 2>/dev/null || true
+# --profile "*" on both downs: raft-node-4/5 sit behind a profile a plain `down` skips, and only an
+# in-scope service gets its --rmi image removed — clean means every profile, same as `make down`.
+docker compose --profile "*" down --volumes --remove-orphans --rmi local 2>/dev/null || true
 echo "== checking nothing else holds the cluster ports =="
 # After our own `down`, any remaining listener on 8001-8003 is a foreign cluster — usually
 # `make run-local` or the IDE debug node. Its specific 127.0.0.1 bind beats compose's
@@ -25,5 +27,5 @@ docker compose build --no-cache
 echo "== starting and waiting for health =="
 docker compose up -d --wait
 ./scripts/smoke.sh
-docker compose down --volumes
+docker compose --profile "*" down --volumes
 echo "== CLEAN START PASS: the compose path works from scratch =="

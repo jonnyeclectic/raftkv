@@ -555,7 +555,8 @@ let NODES = (params.get("nodes")
    two permanent unreachable cards is worse than not knowing.
 
    The default is 8004 and 8005: where the first two `provision node` presses land, and
-   also the two idle nodes compose still ships pre-declared. So the common case needs no
+   also the two staged learners compose declares dormant behind a profile
+   (`docker compose up -d raft-node-4` starts one). So the common case needs no
    query string — a provisioned node-4 is already being knocked on. Above that,
    registerProvisioned() appends to this list at runtime; `?probe=` does the same thing
    for a node this tab did not start (`make node-up N=6` prints the URL), and
@@ -570,6 +571,26 @@ function probeList(params) {
     .map(s => s.trim())
     .map(s => /^\d+$/.test(s) ? `127.0.0.1:${s}` : s)
     .filter(a => /^[A-Za-z0-9.-]+:\d+$/.test(a));
+}
+
+/* The ladder: ordinals are sequential in every runtime here (subprocess spawn fills
+   8004 upward, compose numbers its containers, StatefulSet ordinals are sequential by
+   construction), so an ANSWERING probe address is evidence the next port is worth
+   knocking on. discover() climbs one rung per answer — that is how a reloaded page
+   finds node-6..8 with no query string, when the default list stops at 8005. Loopback
+   only: the 800N convention is this browser's side of a port-forward or a published
+   port, not a property of arbitrary hosts an operator put in ?probe=. Capped at the
+   provision ceiling (RAFT_PROVISION_MAX defaults to 12; tests/test_deploy_topology.py
+   pins the two numbers together) so the list stays bounded — at most one silent port
+   past the highest node, never an open-ended scan. Known gap, accepted: the ladder
+   stops at the first silent rung, so while node-6 is mid-restart a fresh page load
+   cannot see 7 and 8 until the StatefulSet replaces it. Gapless ordinals is the
+   invariant every runtime here maintains, and ?probe= remains the manual override. */
+const LADDER_TOP = 8012;
+function probeSuccessor(addr) {
+  const m = /^127\.0\.0\.1:(\d+)$/.exec(addr);
+  if (!m || Number(m[1]) >= LADDER_TOP) return null;
+  return `127.0.0.1:${Number(m[1]) + 1}`;
 }
 /* --- end probe list ---------------------------------------------------------------- */
 const PROBE = probeList(params);
@@ -689,7 +710,15 @@ async function discover() {
       return r.ok ? addr : null;
     } catch { return null; /* nothing there; ask again next tick */ }
   }));
-  for (const addr of answered) if (addr && !NODES.includes(addr)) NODES.push(addr);
+  for (const addr of answered) {
+    if (!addr) continue;
+    if (!NODES.includes(addr)) NODES.push(addr);
+    // An answering address earns a knock on the next port (the probe-list ladder):
+    // one rung per tick is what climbs a reloaded page back up to node-8 from the
+    // 8004,8005 default.
+    const next = probeSuccessor(addr);
+    if (next && !PROBE.includes(next) && !NODES.includes(next)) PROBE.push(next);
+  }
 }
 /* --- end discovery ----------------------------------------------------------------- */
 
@@ -750,6 +779,19 @@ function registerProvisioned(addr, PROBE) {
   if (PROBE.includes(addr)) return false;  // already knocked on twice a second
   PROBE.push(addr);
   return true;
+}
+
+/* What a failed provision press should SAY. The server's refusals arrive as 409s with
+   a `detail` written to be shown to whoever pressed the button -- pass those through
+   untouched. A 404 is different: it is what RAFT_PROVISION_ENABLED=0 looks like from
+   the browser (the route is not mounted; k8s/raftkv.yaml ships that way on purpose),
+   and FastAPI's stock "Not Found" reads as a bug rather than a policy. */
+function provisionFailureMessage(status, d) {
+  if (status === 404) {
+    return "provisioning is disabled on this deployment (RAFT_PROVISION_ENABLED=0); "
+      + "grow it from the orchestrator instead";
+  }
+  return `${d.detail ?? d.error ?? status}`;
 }
 /* --- end provisioning -------------------------------------------------------------- */
 
@@ -1879,15 +1921,22 @@ function renderFilters(lines) {
 }
 
 async function refreshLogs() {
-  const lines = [];
-  await Promise.all(NODES.map(async addr => {
+  // One batch per node, flattened in NODES order — Promise.all preserves input order,
+  // so events tied on `ts` (same millisecond; a flood produces hundreds) land the same
+  // way every poll. Pushing into a shared array per-response ordered ties by network
+  // completion instead, which flips between polls: the feed visibly reshuffled twice a
+  // second while nothing was happening.
+  const batches = await Promise.all(NODES.map(async addr => {
     try {
       const r = await fetch(`http://${addr}/logs`, {signal: AbortSignal.timeout(900)});
-      if (r.ok) (await r.json()).forEach(e => lines.push(e));
+      if (r.ok) return await r.json();
     } catch {}
+    return [];
   }));
+  const lines = batches.flat();
   // Newest FIRST: the interesting line is the one that just happened,
-  // and nobody should be scrolling a live feed to find it.
+  // and nobody should be scrolling a live feed to find it. Stable sort, so ties keep
+  // the deterministic node-then-emission order built above.
   lines.sort((a, b) => b.ts - a.ts);
 
   // Replication events since the last poll become pulses on the graph. This is the
@@ -2094,7 +2143,7 @@ async function provisionNode() {
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) {
-      setStatus(`provision failed: ${d.detail ?? d.error ?? r.status}`, "err");
+      setStatus(`provision failed: ${provisionFailureMessage(r.status, d)}`, "err");
       return;
     }
     registerProvisioned(d.addr, PROBE);

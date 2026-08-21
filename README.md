@@ -159,7 +159,8 @@ of PreVote.
 | `src/raftkv/build.py` | `ui` / `srv` build stamps: content hashes, one recomputed per request and one frozen at import |
 | `src/raftkv/flood.py` | Server-side load generator (`distinct` / `overwrite` / `mixed`), gated by `RAFT_ADMIN_ENABLED` |
 | `src/raftkv/provision.py` | Starts another raftkv **process** on demand (`POST /admin/spawn-node`), staged and joining nothing — so the dashboard grows the cluster from three with no terminal. Bounded, argv-only, and refuses inside a container |
-| `src/raftkv/app.py` | FastAPI wiring: Raft RPCs, KV API, `/state`, `/logs`, `/healthz`, `/build`, `/admin/*`, exception handlers |
+| `src/raftkv/k8s_provision.py` | The same button on Kubernetes (`RAFT_PROVISION_K8S=1`): `POST /admin/spawn-node` becomes a StatefulSet scale-up through the API server, authenticated as the pod's ServiceAccount and bounded by an RBAC Role that allows get/patch on one StatefulSet's scale and nothing else. Grows by exactly one, optimistically locked, rolls back a pod that never answers — and refuses anywhere that is not demonstrably a pod |
+| `src/raftkv/app.py` | FastAPI wiring: Raft RPCs, KV API, `/state`, `/logs`, `/healthz`, `/livez`, `/build`, `/admin/*`, exception handlers |
 | `src/raftkv/static/dashboard.html` | Operational dashboard: vanilla JS + Canvas 2D, zero dependencies. Health strip, live topology graph, per-node detail, failure injection, event feed |
 | `tests/conftest.py` | Shared fixtures: nodes over `MemoryTransport`, fast timers, simulated clusters |
 | `tests/chaos.py` | `ChaosTransport`: seeded delay, loss, duplication and reordering on top of `MemoryTransport`, so a failing schedule replays exactly |
@@ -191,9 +192,9 @@ of PreVote.
 | `tests/test_debug_entrypoint.py` | The IDE debug entrypoint, which nobody runs in CI and everybody runs before stepping through node-1 |
 | `tests/test_dashboard_leader.py` | The dashboard's leader pick, run under node: highest term wins over first-seen, and `writes` counts reachable voters rather than live ones |
 | `tests/test_dashboard_staged.py` | The member-vs-staged split, run under node: a process in nobody's configuration is drawn as unattached, an attached learner is not, and a crashed member never reclassifies itself out of the cluster |
-| `tests/test_dashboard_probe.py` | The probe list, run under node: `?probe=` extends it to a node provisioned while the page is open, a bare port means loopback, and anything that is not `host:port` is dropped rather than fetched twice a second forever |
+| `tests/test_dashboard_probe.py` | The probe list, run under node: `?probe=` extends it to a node provisioned while the page is open, a bare port means loopback, anything that is not `host:port` is dropped rather than fetched twice a second forever, and the ladder (an answering `800N` earns a knock on `800N+1`) stays loopback-only and capped at the provision ceiling |
 | `tests/test_dashboard_adopt.py` | Membership adoption, run under node: members are picked up from the configuration they replicate (so a page reload keeps them), while a peer-only address like `raft-node-4:8000` is never adopted into a card the browser cannot reach |
-| `tests/test_dashboard_discover.py` | The discovery tick against a stubbed, deliberately out-of-order network: cards are ordered by the probe list rather than by who answered first, and no address is ever adopted twice |
+| `tests/test_dashboard_discover.py` | The discovery tick against a stubbed, deliberately out-of-order network: cards are ordered by the probe list rather than by who answered first, no address is ever adopted twice, and the probe ladder climbs exactly one rung per answering address — nothing for silence, nothing past 8012 |
 | `tests/test_dashboard_flood.py` | The flood panel's wording and tint, run under node: failures are named and go amber even when the run completed, and a cancelled flood never reads as done |
 | `tests/test_dashboard_keys.py` | The state machine's key display, run under node: numeric runs sort as numbers (`k8` before `k79` before `k80`), and a scroll position survives the 500 ms card rebuild |
 | `tests/test_dashboard_role_automaton.py` | The per-node role automaton, run under node: role changes reconstructed from the node's own event log rather than sampled from `role` at 2 Hz, because the interesting transitions are shorter than the poll. Pins the three things a plausible-looking diagram gets wrong &mdash; a lost straw poll is a self-loop and never a candidacy (PreVote's whole claim), a CheckQuorum resignation is distinguished from a leader that merely met a newer term, and `became_follower` carries the role being *left* |
@@ -207,11 +208,15 @@ of PreVote.
 | `tests/test_commit_scan.py` | The sparse commit scan: same index the exhaustive walk would commit, without the O(N²) `term_at()` cost a burst used to pay — checked against the old walk as an oracle over both hand-picked and Hypothesis-generated logs |
 | `tests/test_config_lookup.py` | `last_config()` stays on the partial index, because it is on the write path and unindexed it scanned 2.475 ms against 15,000 entries |
 | `tests/test_dashboard_voters.py` | The per-card "N voting" summary, run under node: counted from the configuration rather than the transport peer map, so a learner no longer counts itself |
-| `tests/test_provision.py` | `POST /admin/spawn-node`: the argv is a constant shaped by one integer (no shell, nothing interpolated), the cap holds on both allocation paths (an explicit ordinal cannot skip the window), node-4 is the floor, a child that never answers is reaped, and it refuses inside a container where the process would be unreachable by design |
-| `tests/test_dashboard_provision.py` | Which node is asked to provision and what happens to the address it returns, run under node: the highest-term leader, never a learner or a staged node, falling back to a member mid-election — and the address joins the probe list rather than the card list |
+| `tests/test_dashboard_feed_order.py` | The event feed's merge, run under node — the shipped `refreshLogs` executed against both network completion orders: one batch per node, flattened in `NODES` order and stable-sorted newest-first, so events tied on `ts` (a flood produces hundreds per millisecond) render identically on every poll instead of reshuffling with whichever response landed first |
+| `tests/test_provision.py` | `POST /admin/spawn-node`: the argv is a constant shaped by one integer (no shell, nothing interpolated), the cap holds on both allocation paths (an explicit ordinal cannot skip the window), node-4 is the floor, a child that never answers is reaped, and it refuses inside a container **or a Kubernetes pod** (`KUBERNETES_SERVICE_HOST` is a tell — containerd pods leave no `/.dockerenv`) where the process would be unreachable by design — with a refusal that names growth verbs that actually exist (`docker compose up -d raft-node-4`, `statefulset/node`). Filesystem errors on the spawn path (a read-only root filesystem) surface as the same readable 409, never a 500 |
+| `tests/test_k8s_provision.py` | The k8s provisioning backend, with the API server and the new pod both played by an httpx MockTransport: it runs nowhere but a demonstrable pod (kubelet env var **and** mounted ServiceAccount — a leaked env var alone buys nothing), grows by exactly `current + 1` under the cap with the resourceVersion as an optimistic lock, refuses to jump ordinals, reads a 403 as "the Role is missing", rolls back a scale-up whose pod never answers, and `RAFT_PROVISION_K8S=1` routes the endpoint to this backend before any subprocess code runs |
+| `tests/test_dashboard_provision.py` | Which node is asked to provision and what happens to the address it returns, run under node: the highest-term leader, never a learner or a staged node, falling back to a member mid-election — and the address joins the probe list rather than the card list. Plus what a failed press *says*: server refusals pass through untouched, and the 404 of a deployment that ships `RAFT_PROVISION_ENABLED=0` reads as policy, not as "Not Found" |
+| `tests/test_e2e_provision_dashboard.py` | The provisioning fixes end to end — real uvicorn nodes on dynamic ports, real chromium, the shipped dashboard — because the bug they pin was invisible at every smaller scope: an unmapped `OSError` became a 500, the generic 500 left from outside the CORS middleware, and a cross-origin tab rendered the whole exchange as `provision failed: TypeError: Failed to fetch`. Asserts on the status line the operator actually reads, for the k8s refusal, the filesystem refusal (same- and cross-origin), the disabled-by-flag 404, and the happy path still spawning a real staged child. Opt-in via `make e2e`; skips cleanly without playwright |
 | `tests/test_admin_timing.py` | The tempo controls: a live timing update is revalidated as a whole config (the §5.2 ratios hold mid-flight) and reaches the running timer without a restart; `campaign` elects exactly the node asked, refuses a sitting leader, and never moves a learner |
 | `tests/test_chaos_soak.py` | Randomized message schedules against the safety properties: a seeded hostile network, faults drawn rather than scripted, and a reproducible seed on any failure |
 | `tests/test_ci_gate.py` | The gating policy tested like the rest of the system: one un-skippable required check, and every job in `ci.yml` reachable from its `needs` |
+| `tests/test_deploy_topology.py` | The deploy files behind the voter/staged split, pinned like test_ci_gate.py pins the workflows: compose profiles on exactly raft-node-4/5, StatefulSet named `node` with `ordinals.start: 1`, liveness and readiness reading their own endpoints, pods provisioning through the scale backend (`RAFT_PROVISION_ENABLED=1` **and** `RAFT_PROVISION_K8S=1`, so the button means `kubectl scale` and never a process spawn), and the RBAC triple pinned minimal: get/patch on the scale of the one named StatefulSet, worn by the pods via `serviceAccountName` — what keeps the advertised growth verbs true. Also pins the provision cap's three copies to each other (config default, `K8S_FORWARD_MAX`, the dashboard's `LADDER_TOP`), so every pod the button can create is forwardable and probeable |
 | `tests/test_docs_matrix.py` | These tables, in both directions: every test file has a row, every row names a file that exists, every doc is linked — plus every `tests/…::test_name` cited anywhere in the shipped prose, down to the test name, and every embedded image resolving to a file that is actually here |
 | `scripts/smoke.sh` | End-to-end check against a running compose cluster |
 | `scripts/clean_start_check.sh` | THE clean-start gate: the compose path works from absolutely clean state |
@@ -219,8 +224,8 @@ of PreVote.
 | `scripts/node_up.sh` | Provisions one more staged process from a terminal — what the dashboard's **provision node** button does over HTTP |
 | `scripts/debug_node.py` | The IDE debug target for node-1 (a script, not `-m uvicorn` — see its docstring) |
 | `Dockerfile` | `python:3.14-slim`, non-root user, uvicorn entrypoint |
-| `docker-compose.yml` | Three voting nodes on 8001–8003 plus an idle learner on 8004, healthchecks, named volumes |
-| `k8s/raftkv.yaml` | StatefulSet + headless Service (stable peer DNS) for kind |
+| `docker-compose.yml` | Three voting nodes on 8001–8003, plus two dormant staged learners (8004/8005) behind a compose profile — declared but not started until `docker compose up -d raft-node-4` asks for one — healthchecks, named volumes |
+| `k8s/raftkv.yaml` | StatefulSet (pods `node-1`…`node-N` via `ordinals.start`, so k8s node ids match compose/local) + headless Service (stable peer DNS) for kind |
 | `docs/` | Code tour, architecture, Raft walkthrough, failure modes, overview, CI |
 
 ## Test matrix
@@ -235,7 +240,7 @@ of PreVote.
 | Staying leader, and stopping | `tests/test_check_quorum.py`, `tests/test_pre_vote.py` | The two halves of "who is allowed to lead, and for how long", which only work as a pair. CheckQuorum: a leader in contact with nobody resigns after one election timeout instead of claiming the role for the length of the partition, it needs a majority of *both* halves during a joint transition, any answer counts as contact (a rejection is still a reachable peer), and a single-voter cluster never resigns at all. PreVote: a poll costs the receiver no term, no persisted vote and no timer reset; a node that can hear its leader refuses to help depose it, and a leader refuses for as long as it leads &mdash; without which the first follower whose timer drifts unseats a healthy incumbent using the incumbent's own vote. Together: an isolated node steps down, stays at its original term however long the partition lasts, and disturbs nothing when it heals |
 | Injected failure | `tests/test_admin_failure.py`, `tests/test_partition.py`, `tests/test_reset.py` | The failure-injection controls do what they claim: a crashed node refuses every surface except the dashboard and `/admin/recover`; a partition is cut in both directions and a partitioned leader commits nothing; reset destroys exactly the state Figure 2 requires to be durable, and keeps the membership that a revert would turn into a second quorum |
 | Membership (§6) | `tests/test_learner.py`, `tests/test_joint_consensus.py`, `tests/test_membership_growth.py` | A learner is replicated to but never counted for quorum; promotion runs through joint consensus needing separate majorities of both configurations; and a live cluster grown 3 → 4 → 5 keeps committing throughout, then tolerates the failures its new size promises |
-| Provisioning (the other half of growth) | `tests/test_provision.py`, `tests/test_dashboard_provision.py` | Membership is a log entry, so `add-learner` can only ever attach something already running — which is why the cluster now starts its own processes on demand instead of shipping idle ones. This is the sharpest endpoint in the build (every other admin route makes *this* process misbehave; this one starts new ones, unauthenticated), so the weight is on the three properties that keep it from being remote code execution: the argv is a constant shaped by one bounded integer with no shell anywhere, the count is capped, and it refuses inside a container — where a child would share the node's network namespace and advertise an address that resolves, for every peer, to that peer's own loopback. Plus the UI decisions: the highest-term leader is asked (never a learner, never a staged node), and the returned address joins the probe list rather than the card list, so no card renders before discovery has classified it |
+| Provisioning (the other half of growth) | `tests/test_provision.py`, `tests/test_dashboard_provision.py` | Membership is a log entry, so `add-learner` can only ever attach something already running — which is why the cluster now starts its own processes on demand instead of shipping idle ones. This is the sharpest endpoint in the build (every other admin route makes *this* process misbehave; this one starts new ones, unauthenticated), so the weight is on the three properties that keep it from being remote code execution: the argv is a constant shaped by one bounded integer with no shell anywhere, the count is capped, and it refuses inside a container or a Kubernetes pod — where a child would share the node's network namespace and advertise an address that resolves, for every peer, to that peer's own loopback. Plus the UI decisions: the highest-term leader is asked (never a learner, never a staged node), and the returned address joins the probe list rather than the card list, so no card renders before discovery has classified it |
 | Concurrency under load | `tests/test_flood.py`, `tests/test_flood_endpoint.py` | Many client writes genuinely in flight at once: distinct keys, contention on one key, and non-`set` commands through the applier — with every node agreeing on the winner, decided by log order rather than send order. Plus the `/admin/flood` contract the dashboard drives it through: start returns immediately, progress is pollable, refusals are documented. And the accounting holds under a failing write: one unexpected error is isolated into a `failed` count instead of abandoning the rest of the burst |
 | Dashboard logic | `tests/test_dashboard_leader.py`, `tests/test_dashboard_staged.py`, `tests/test_dashboard_flood.py`, `tests/test_dashboard_keys.py` | The four pieces of UI logic that can misreport the cluster. The leader pick: with a stale leader and the real one both self-reporting LEADER, the panel picks by highest term (not address order), routes writes there, and calls an isolated leader's writes unavailable. The member split: a running process in nobody's configuration is drawn as staged rather than as a broken member, and a *crashed* node stays a member — reclassifying it would shrink the quorum denominator at exactly the moment the cluster is surviving that failure. The flood summary: a run that finished having timed out most of its writes is tinted amber and names the failures, rather than reading as a clean sweep. The key display: numeric runs sort as numbers, so a flood's keys read in sequence instead of `k1, k10, k100, k11, k2`, and a scroll position survives the 500 ms rebuild that would otherwise reset it twice a second. All four sliced out of the shipped HTML and executed under node; skipped if node is absent |
 | Build provenance | `tests/test_build_stamp.py` | The stamp describes the bytes it claims to: `ui` is recomputed per request (never cached), `srv` is frozen at import, the served page carries its own hash with no placeholder left behind, `/build` answers even while crashed, and nodes on different builds report `MIXED` rather than agreement |
@@ -248,9 +253,14 @@ of PreVote.
 
 - `make install` — `uv sync --all-extras`
 - `make test` — full pytest suite
+- `make e2e` — the browser lane: real nodes, real chromium, the shipped dashboard
+  (`tests/test_e2e_provision_dashboard.py`); playwright arrives via `uv run --with`, so
+  the lockfiles never carry it
 - `make lint` — ruff over src and tests
 - `make demo` — build + start the three-node compose cluster, dashboard on :8001
-- `make down` — stop the cluster and delete its volumes
+- `make down` — stop the cluster and delete its volumes, across every compose profile:
+  plain `docker compose down` only covers active profiles, so it would leave a
+  hand-started `raft-node-4`/`-5` running
 - `make smoke` — end-to-end smoke test against the running cluster
 - `make clean-start-check` — the clean-start gate: everything works from clean state
 - `make run-local` — nodes 2–3 locally; you run node-1 under the debugger. Nothing above
@@ -265,9 +275,12 @@ of PreVote.
 - `make k8s-demo` — kind cluster + StatefulSet variant. **Run this first**: the other
   `k8s-*` targets need the cluster it creates, and refuse with one line if it is absent
   (kubectl's own failure here is a `localhost:8080 connection refused` that reads like a
-  broken command rather than a missing cluster)
-- `make k8s-forward` — port-forward pods to localhost 8001–8005 (auto-reconnects when a pod is replaced)
-- `make k8s-scale N=5` — provision more pods. They come up **staged**: a replica is a process, not a member, so attach and promote them from the dashboard to actually grow the cluster
+  broken command rather than a missing cluster). The StatefulSet is named `node`, so pods
+  are `node-1`…`node-N`; a StatefulSet cannot be renamed in place, so a cluster deployed
+  before the rename needs `make k8s-down && make k8s-demo` (the old `data-raftkv-N` PVCs
+  are orphaned, which a kind demo cluster can afford)
+- `make k8s-forward` — port-forward pods to localhost, `node-N` ↔ `800N`, for every provisionable ordinal (auto-reconnects when a pod is replaced, and a forward for a pod that does not exist yet comes alive when the provision button creates it)
+- `make k8s-scale N=5` — provision more pods. They come up **staged**: a replica is a process, not a member, so attach and promote them from the dashboard to actually grow the cluster. The dashboard's **provision node** button does the same scale-up from the browser — through the API server, as the RBAC-bounded `raftkv-provisioner` ServiceAccount (`src/raftkv/k8s_provision.py`), never as a process spawn
 - `make k8s-down` — delete the kind cluster
 
 ## Running locally
@@ -370,6 +383,18 @@ It prints the URL that brings it in — reopen the dashboard at
 **attach as learner** on its own card. `?probe=` **replaces** the default list rather than
 adding to it, so keep 8004 and 8005 in it or those two stop being watched. The default is
 short on purpose: every address on it is a fetch twice a second for the whole session.
+It also climbs on its own — an answering `800N` earns a knock on `800N+1`, up to the
+provision cap — so a gapless run of provisioned nodes (the normal case on every runtime)
+reappears after a reload with no query string at all. `?probe=` is for the exception: a
+node started beyond a gap the ladder will not cross.
+
+On the compose runtime the same step is `docker compose up -d raft-node-4` (or `-5`): the
+two staged learners are declared behind a compose profile, dormant until named — naming a
+profiled service activates its profile on Compose v2.20+; older Compose needs it spelled
+out, `docker compose --profile staged up -d raft-node-4` — and they land on 8004/8005,
+ports the default probe list already watches. Past node-5 it is a service block (carrying
+the same `staged` profile, or `make demo` starts it) plus two volumes in
+`docker-compose.yml` first, then the same command.
 
 Attaching is one control, not two. A typed-address box in the CONTROL panel would be a
 second way to do what the card already does, and the card is strictly better informed —

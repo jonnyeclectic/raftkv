@@ -51,9 +51,10 @@ console.log(JSON.stringify(probeList(new URLSearchParams({json.dumps(query)}))))
 
 def test_default_is_the_first_two_provisionable_slots():
     """8004 and 8005 are where the first two `provision node` presses land, and they are
-    also the two idle nodes docker-compose still ships pre-declared (a container cannot
-    spawn its own siblings). Probing them by default is what makes a provisioned node-4
-    appear in the staged row with no query string and no PROBE mutation at all."""
+    also the two staged learners docker-compose declares dormant behind a profile (a
+    container cannot spawn its own siblings, so `docker compose up -d raft-node-4` is
+    that runtime's provision verb). Probing them by default is what makes a provisioned
+    node-4 appear in the staged row with no query string and no PROBE mutation at all."""
     assert run("") == IDLE
 
 
@@ -90,3 +91,42 @@ def test_whitespace_around_an_entry_does_not_disqualify_it():
     """A pasted list carries spaces. Dropping `8006` because it arrived as ` 8006`
     would look exactly like the node failing to start."""
     assert run("?probe=8004, 8005 ,8006") == [*IDLE, "127.0.0.1:8006"]
+
+
+def successor(addr: str) -> str | None:
+    """What the ladder would knock on after `addr` answered."""
+    script = f"""
+{probe_source()}
+console.log(JSON.stringify(probeSuccessor({json.dumps(addr)})));
+"""
+    out = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_an_answering_port_earns_a_knock_on_the_next_one():
+    """The reload path for a cluster grown past the default list: ordinals are
+    sequential in every runtime here, so a node at 800N answering is evidence 800N+1
+    is worth knocking on. This is what climbs a fresh page back up to node-8 when the
+    default probe list stops at 8005."""
+    assert successor("127.0.0.1:8004") == "127.0.0.1:8005"
+    assert successor("127.0.0.1:8011") == "127.0.0.1:8012"
+
+
+def test_the_ladder_stops_at_the_provision_ceiling():
+    """8012 is the last provisionable port (RAFT_PROVISION_MAX defaults to 12, and
+    test_deploy_topology.py pins the two numbers together). Without the cap the block
+    comment's 'deliberately NOT open-ended' promise stops being true: a full cluster
+    would knock on 8013 twice a second forever."""
+    assert successor("127.0.0.1:8012") is None
+
+
+def test_the_ladder_never_leaves_loopback():
+    """800N is the browser's side of a port-forward or a published port — a convention
+    about THIS machine. An operator's custom ?probe= host proves nothing about its
+    neighbours' ports."""
+    assert successor("10.0.0.5:8004") is None
+    assert successor("raft-node-4:8000") is None

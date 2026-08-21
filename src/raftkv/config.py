@@ -28,6 +28,13 @@ class NodeConfig(BaseModel):
     # creates new ones, and a deployment that wants the failure controls for a demo should
     # not have to accept process spawning to get them. See provision.py.
     provision_enabled: bool = True
+    # Which backend /admin/spawn-node uses. False: start a sibling PROCESS on this host
+    # (provision.py). True: add one replica to the StatefulSet via the Kubernetes API,
+    # authenticated as the pod's ServiceAccount (k8s_provision.py). Explicit opt-in set
+    # only by k8s/raftkv.yaml, never runtime-detected — and safe against misuse from
+    # either side: the k8s backend refuses anywhere that is not demonstrably a pod, and
+    # the subprocess backend refuses inside any container.
+    provision_k8s: bool = False
     # How many processes one cluster will start, ever. Same reasoning as flood.MAX_TOTAL:
     # an unauthenticated endpoint that spawns unbounded processes is a fork bomb with a
     # REST API. Ordinals stay two digits so the port stays 8000 + N.
@@ -81,6 +88,7 @@ class NodeConfig(BaseModel):
             ("commit_timeout", "RAFT_COMMIT_TIMEOUT"),
             ("admin_enabled", "RAFT_ADMIN_ENABLED"),
             ("provision_enabled", "RAFT_PROVISION_ENABLED"),
+            ("provision_k8s", "RAFT_PROVISION_K8S"),
             ("provision_max_nodes", "RAFT_PROVISION_MAX"),
             ("learner", "RAFT_LEARNER"),
             ("advertise_addr", "RAFT_ADVERTISE"),

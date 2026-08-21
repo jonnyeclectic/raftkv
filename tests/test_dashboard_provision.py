@@ -160,3 +160,30 @@ def test_a_malformed_address_is_dropped_rather_than_probed(addr):
     r = run(f"registerProvisioned({json.dumps(addr)}, PROBE)", {}, [], [])
     assert r["value"] is False
     assert r["PROBE"] == []
+
+
+# ---- what a failed press says ----------------------------------------------------------
+
+
+def test_a_missing_route_reads_as_policy_not_not_found():
+    """404 is what RAFT_PROVISION_ENABLED=0 looks like from the browser — the route is
+    not mounted, which k8s/raftkv.yaml does on purpose. FastAPI's stock "Not Found"
+    reads as a bug; the message must name the flag and point at the orchestrator."""
+    r = run('provisionFailureMessage(404, {detail: "Not Found"})', {}, [])
+    assert "RAFT_PROVISION_ENABLED" in r["value"]
+    assert "Not Found" not in r["value"]
+
+
+def test_a_server_refusal_passes_through_untouched():
+    """409 details are written server-side to be shown to whoever pressed the button
+    (see ProvisionError) — the page must not editorialise them."""
+    detail = "port 8004 is already in use."
+    r = run(f'provisionFailureMessage(409, {{detail: {json.dumps(detail)}}})', {}, [])
+    assert r["value"] == detail
+
+
+def test_a_bodyless_failure_falls_back_to_the_status_code():
+    """`r.json().catch(() => ({}))` hands this an empty object when the body was not
+    JSON; the code is the only information left."""
+    r = run("provisionFailureMessage(502, {})", {}, [])
+    assert r["value"] == "502"
