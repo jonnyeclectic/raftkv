@@ -162,6 +162,23 @@ def test_a_silent_rung_earns_nothing():
     assert got["probe"] == ["127.0.0.1:8004", "127.0.0.1:8005"]
 
 
+def test_a_promoted_member_does_not_break_the_ladder():
+    """Local runtime: provision 4-6, promote node-6 to voter, reload. The member's
+    loopback addr arrives through adoptableAddrs() BEFORE the probe map runs, so it
+    never answers a probe fetch — but its rung must still hold, or the staged node-7
+    above it is invisible on every reload. Two ticks, both load-bearing: the first
+    must push 8006 into PROBE even though it is already a member card, the second
+    must count that card as answering and climb on to 8007."""
+    member = "127.0.0.1:8006"
+    tick1 = run(nodes=[*CLUSTER, member], probe=["127.0.0.1:8004", "127.0.0.1:8005"],
+                answers=["127.0.0.1:8004", "127.0.0.1:8005"])
+    assert tick1["probe"] == ["127.0.0.1:8004", "127.0.0.1:8005", member]
+    tick2 = run(nodes=[*CLUSTER, "127.0.0.1:8004", "127.0.0.1:8005", member],
+                probe=list(tick1["probe"]), answers=[])
+    assert tick2["probe"][-1] == "127.0.0.1:8007"
+    assert tick2["nodes"].count(member) == 1, "the member card must not be re-adopted"
+
+
 def test_the_ladder_is_capped_at_the_provision_ceiling():
     """An answering 8012 (the last provisionable port; RAFT_PROVISION_MAX defaults to
     12) must not earn a knock on 8013 — the probe list's bounded-forever promise."""

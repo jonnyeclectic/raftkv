@@ -704,7 +704,11 @@ async function discover() {
   // whenever 8005 answered first, so the order changed between page loads for no visible
   // reason. NODES order is card order (memberAddrs/stagedAddrs filter it).
   const answered = await Promise.all(PROBE.map(async addr => {
-    if (NODES.includes(addr)) return null;
+    // Already a card: no fetch needed, but it still counts as ANSWERING for the
+    // ladder below — a node-6 promoted to voter arrives through adoptableAddrs()
+    // above rather than through this fetch, and if that silenced its rung the climb
+    // would stop there and a staged node-7 above it would be invisible on reload.
+    if (NODES.includes(addr)) return addr;
     try {
       const r = await fetch(`http://${addr}/state`, {signal: AbortSignal.timeout(700)});
       return r.ok ? addr : null;
@@ -715,9 +719,11 @@ async function discover() {
     if (!NODES.includes(addr)) NODES.push(addr);
     // An answering address earns a knock on the next port (the probe-list ladder):
     // one rung per tick is what climbs a reloaded page back up to node-8 from the
-    // 8004,8005 default.
+    // 8004,8005 default. The next rung joins PROBE even when it is already a member
+    // card, so the ladder can keep climbing past it — the branch above makes that
+    // entry free.
     const next = probeSuccessor(addr);
-    if (next && !PROBE.includes(next) && !NODES.includes(next)) PROBE.push(next);
+    if (next && !PROBE.includes(next)) PROBE.push(next);
   }
 }
 /* --- end discovery ----------------------------------------------------------------- */
