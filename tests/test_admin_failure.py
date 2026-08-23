@@ -51,6 +51,33 @@ def test_dashboard_and_recover_stay_reachable_while_crashed(client):
     assert client.post("/admin/recover").status_code == 200
 
 
+def test_livez_stays_200_while_crashed_and_recover_restores_healthz(client):
+    """The probe split, end to end. /healthz answers "treat as serving?" and must go
+    dark with the node; /livez answers "is this process beyond self-repair?" and must
+    not — a simulated crash is deliberate and admin-recoverable, and when the k8s
+    liveness probe read /healthz the kubelet restarted a killed pod after ~30s, so the
+    fresh process booted with crashed=False and the kill button un-killed itself.
+
+    The kubelet is not a peer, so answering it does not break the contract at the top
+    of this file: peers dial the Raft RPCs, which stay 503. And a REAL crash is not
+    exempted from liveness — a dead process fails /livez by refusing the connection.
+
+    The recover half is the other load-bearing pin: recover() must restart the
+    background loops (start() rebuilds them), or a just-revived node would sit at
+    /livez 503 and be restarted by the kubelet moments after an admin revived it."""
+    wait_for_leader(client)
+    assert client.get("/livez").json() == {"ok": True, "node": "solo", "crashed": False}
+    assert client.get("/healthz").status_code == 200
+
+    client.post("/admin/crash")
+    assert client.get("/livez").json() == {"ok": True, "node": "solo", "crashed": True}
+    assert client.get("/healthz").status_code == 503  # NotReady: looks down, stays down
+
+    client.post("/admin/recover")
+    assert client.get("/livez").json() == {"ok": True, "node": "solo", "crashed": False}
+    assert client.get("/healthz").status_code == 200
+
+
 def test_crash_is_idempotent_and_so_is_recover(client):
     wait_for_leader(client)
     assert client.post("/admin/crash").status_code == 200
@@ -114,6 +141,9 @@ def test_admin_endpoints_absent_when_disabled(tmp_path):
         assert c.post("/admin/crash").status_code == 404
         assert c.post("/admin/recover").status_code == 404
         assert c.get("/state").status_code == 200
+        # liveness is not an admin control: a real deployment that removed the
+        # kill button still needs the kubelet to restart a wedged node
+        assert c.get("/livez").status_code == 200
 
 
 def test_admin_enabled_parses_from_env(monkeypatch, tmp_path):

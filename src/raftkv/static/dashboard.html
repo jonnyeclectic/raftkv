@@ -199,6 +199,65 @@
   /* Long values must not widen the card and break the three-across layout. */
   .kvscroll td:last-child { overflow-wrap: anywhere; }
 
+  /* ---------- role automaton ----------
+     Boxes and text, not the canvas the topology uses. The topology animates a ring whose
+     positions are computed every frame; this is a FIXED diagram whose only moving part is
+     which box is lit, which is a class change rather than a redraw. Text also means the
+     states survive into the accessibility tree and into a markup assertion, neither of
+     which a canvas offers. */
+  .fsm {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: var(--s1) var(--s2);
+    align-items: center;
+    padding: var(--s3) 0 var(--s2);
+  }
+  .fsm .st {
+    border: 1px solid var(--line-hi);
+    border-radius: 4px;
+    padding: var(--s1) var(--s2);
+    text-align: center;
+    font-size: var(--t1);
+    letter-spacing: .06em;
+    color: var(--ink-dim);
+    white-space: nowrap;
+  }
+  .fsm .st.wide { grid-column: 1 / -1; }
+  /* The current state is the entire point of the panel, so it is the only thing here
+     with colour -- and it borrows the same three the cards and the graph already use, so
+     "amber means candidate" means one thing everywhere on the page. */
+  .fsm .st.now { color: var(--bg); font-weight: 600; }
+  .fsm .st.now.follower  { background: var(--follower);  border-color: var(--follower); }
+  .fsm .st.now.candidate { background: var(--candidate); border-color: var(--candidate); }
+  .fsm .st.now.leader    { background: var(--leader);    border-color: var(--leader); }
+  .fsm .ed { text-align: center; font-size: var(--t1); color: var(--ink-dim); }
+  .fsm .ed.wide { grid-column: 1 / -1; }
+  /* The edge most recently taken, so the panel says how the node GOT here and not only
+     where it is. Dim everywhere else: an unlit diagram of five equally-bright arrows is
+     a legend, not a state. */
+  .fsm .ed.took { color: var(--ink); }
+  .fsm-last { font-size: var(--t1); color: var(--ink-mid); padding-bottom: var(--s2); }
+  .fsm-last b { color: var(--ink); font-weight: 600; }
+  /* The ballot and log automata get the same "you are here" signal in NEUTRAL ink. They
+     must not borrow the three role colours: amber has to keep meaning candidate and
+     nothing else everywhere on this page, and `granted` and `committed` are not roles.
+     Lit is lit; which of the three machines you are looking at is the panel's title. */
+  .fsm .st.here {
+    background: var(--line-hi);
+    border-color: var(--ink-dim);
+    color: var(--ink);
+    font-weight: 600;
+  }
+  /* A broken invariant is not a state, so it does not go in the diagram. It goes under
+     it, in the one colour this page reserves for something being wrong. */
+  .fsm-bad {
+    font-size: var(--t1);
+    color: var(--down);
+    padding-bottom: var(--s2);
+    overflow-wrap: anywhere;
+  }
+  .fsm-bad b { font-weight: 600; }
+
   /* ---------- controls ---------- */
   .ctl { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
   .ctl + .ctl { margin-top: var(--s3); }
@@ -462,8 +521,6 @@
         </div>
         <div class="ctl"><span id="flood-status" class="label"></span></div>
         <div class="ctl">
-          <span class="label">"at once" is the interesting knob: the same total commits
-            cleanly in small batches and can starve the heartbeat in one big one</span>
         </div>
       </div>
     </section>
@@ -498,7 +555,8 @@ let NODES = (params.get("nodes")
    two permanent unreachable cards is worse than not knowing.
 
    The default is 8004 and 8005: where the first two `provision node` presses land, and
-   also the two idle nodes compose still ships pre-declared. So the common case needs no
+   also the two staged learners compose declares dormant behind a profile
+   (`docker compose up -d raft-node-4` starts one). So the common case needs no
    query string — a provisioned node-4 is already being knocked on. Above that,
    registerProvisioned() appends to this list at runtime; `?probe=` does the same thing
    for a node this tab did not start (`make node-up N=6` prints the URL), and
@@ -513,6 +571,26 @@ function probeList(params) {
     .map(s => s.trim())
     .map(s => /^\d+$/.test(s) ? `127.0.0.1:${s}` : s)
     .filter(a => /^[A-Za-z0-9.-]+:\d+$/.test(a));
+}
+
+/* The ladder: ordinals are sequential in every runtime here (subprocess spawn fills
+   8004 upward, compose numbers its containers, StatefulSet ordinals are sequential by
+   construction), so an ANSWERING probe address is evidence the next port is worth
+   knocking on. discover() climbs one rung per answer — that is how a reloaded page
+   finds node-6..8 with no query string, when the default list stops at 8005. Loopback
+   only: the 800N convention is this browser's side of a port-forward or a published
+   port, not a property of arbitrary hosts an operator put in ?probe=. Capped at the
+   provision ceiling (RAFT_PROVISION_MAX defaults to 12; tests/test_deploy_topology.py
+   pins the two numbers together) so the list stays bounded — at most one silent port
+   past the highest node, never an open-ended scan. Known gap, accepted: the ladder
+   stops at the first silent rung, so while node-6 is mid-restart a fresh page load
+   cannot see 7 and 8 until the StatefulSet replaces it. Gapless ordinals is the
+   invariant every runtime here maintains, and ?probe= remains the manual override. */
+const LADDER_TOP = 8012;
+function probeSuccessor(addr) {
+  const m = /^127\.0\.0\.1:(\d+)$/.exec(addr);
+  if (!m || Number(m[1]) >= LADDER_TOP) return null;
+  return `127.0.0.1:${Number(m[1]) + 1}`;
 }
 /* --- end probe list ---------------------------------------------------------------- */
 const PROBE = probeList(params);
@@ -626,13 +704,27 @@ async function discover() {
   // whenever 8005 answered first, so the order changed between page loads for no visible
   // reason. NODES order is card order (memberAddrs/stagedAddrs filter it).
   const answered = await Promise.all(PROBE.map(async addr => {
-    if (NODES.includes(addr)) return null;
+    // Already a card: no fetch needed, but it still counts as ANSWERING for the
+    // ladder below — a node-6 promoted to voter arrives through adoptableAddrs()
+    // above rather than through this fetch, and if that silenced its rung the climb
+    // would stop there and a staged node-7 above it would be invisible on reload.
+    if (NODES.includes(addr)) return addr;
     try {
       const r = await fetch(`http://${addr}/state`, {signal: AbortSignal.timeout(700)});
       return r.ok ? addr : null;
     } catch { return null; /* nothing there; ask again next tick */ }
   }));
-  for (const addr of answered) if (addr && !NODES.includes(addr)) NODES.push(addr);
+  for (const addr of answered) {
+    if (!addr) continue;
+    if (!NODES.includes(addr)) NODES.push(addr);
+    // An answering address earns a knock on the next port (the probe-list ladder):
+    // one rung per tick is what climbs a reloaded page back up to node-8 from the
+    // 8004,8005 default. The next rung joins PROBE even when it is already a member
+    // card, so the ladder can keep climbing past it — the branch above makes that
+    // entry free.
+    const next = probeSuccessor(addr);
+    if (next && !PROBE.includes(next)) PROBE.push(next);
+  }
 }
 /* --- end discovery ----------------------------------------------------------------- */
 
@@ -694,6 +786,19 @@ function registerProvisioned(addr, PROBE) {
   PROBE.push(addr);
   return true;
 }
+
+/* What a failed provision press should SAY. The server's refusals arrive as 409s with
+   a `detail` written to be shown to whoever pressed the button -- pass those through
+   untouched. A 404 is different: it is what RAFT_PROVISION_ENABLED=0 looks like from
+   the browser (the route is not mounted; k8s/raftkv.yaml ships that way on purpose),
+   and FastAPI's stock "Not Found" reads as a bug rather than a policy. */
+function provisionFailureMessage(status, d) {
+  if (status === 404) {
+    return "provisioning is disabled on this deployment (RAFT_PROVISION_ENABLED=0); "
+      + "grow it from the orchestrator instead";
+  }
+  return `${d.detail ?? d.error ?? status}`;
+}
 /* --- end provisioning -------------------------------------------------------------- */
 
 /* --- leader selection (behaviour pinned by tests/test_dashboard_leader.py) ---------
@@ -733,6 +838,317 @@ function quorumReach(leader) {
   return n;
 }
 /* --- end leader selection --------------------------------------------------------- */
+
+/* --- role automaton (behaviour pinned by tests/test_dashboard_role_automaton.py) -----
+   Every role change a node has made, reconstructed from ITS OWN event log rather than
+   from watching `role` change between polls. Two reasons that distinction is the design:
+
+     * A 500 ms poll cannot see a transition shorter than 500 ms, and the interesting ones
+       are exactly that short -- follower -> candidate -> leader inside one tick is what an
+       uncontested election looks like. Sampling `role` shows the endpoints and loses the
+       path, so the panel would report "still leader" through an entire election it lost
+       and won back.
+     * An edge is only worth drawing WITH ITS CAUSE, and the cause is never in `/state`.
+       "became follower" is the same word for a leader that lost contact with a majority,
+       a leader that met a newer term, and a candidate that met a live leader -- three
+       different failures wanting three different responses. The log separates them; the
+       role field cannot.
+
+   `_become_follower` logs BEFORE it assigns, so `became_follower` carries the role being
+   LEFT. That is what makes `from` recoverable at all: without it a step-down is an edge
+   with no tail.
+
+   A LOST STRAW POLL IS A SELF-LOOP, not a trip through candidate. That is the whole
+   content of PreVote (thesis 9.6) -- a node that would lose does not run, so it never
+   leaves follower and never touches its term. Drawing it as candidate -> follower would
+   put the mechanism's central claim backwards on the one panel built to show it. */
+
+// crash(), reset() and recover() assign `role = FOLLOWER` DIRECTLY rather than going
+// through _become_follower, so they emit no `became_follower` and log role="follower"
+// themselves -- by the time the line is written the state being left is already gone.
+// Missing them is not cosmetic: a leader that was killed then kept its stale
+// `candidate -> leader` as the newest edge, so the card drew FOLLOWER lit beside a last
+// transition claiming it had just been elected. Found by opening the panel on a live
+// cluster, which is the only place the sequence occurs.
+const FSM_OPERATOR_CAUSE = {
+  crashed:   "crashed (simulated)",
+  reset:     "state wiped by reset",
+  recovered: "restarted from disk",
+};
+
+function roleTransitions(events, nodeId, limit = 8) {
+  // Oldest-first: every cause below is "what happened immediately before".
+  const mine = (events || [])
+    .filter(e => e && e.node === nodeId && e.ts != null)
+    .slice()
+    .sort((a, b) => a.ts - b.ts);
+  const out = [];
+  let quorumLostAt = null;  // set by quorum_lost, consumed by the step-down it explains
+  let seenTerm = null;
+  // The state as reconstructed so far. Needed because the operator events above cannot
+  // say what they interrupted, and because a stuck candidate re-campaigning is
+  // candidate -> candidate rather than follower -> candidate.
+  let state = "follower";
+  const push = (to, cause, e, from) => {
+    out.push({from: from ?? state, to, term: e.term, ts: e.ts, cause});
+    state = to;
+  };
+  for (const e of mine) {
+    const bumped = seenTerm !== null && e.term > seenTerm;
+    if (e.event === "quorum_lost") {
+      quorumLostAt = e.ts;
+    } else if (e.event === "election_started") {
+      push("candidate", "straw poll won, term claimed", e);
+    } else if (e.event === "became_leader") {
+      // Only a candidate is ever elected, so this tail is definitional rather than
+      // reconstructed -- which keeps it right even when the ring buffer starts here.
+      push("leader", `majority granted (quorum ${e.quorum ?? "?"})`, e, "candidate");
+    } else if (e.event in FSM_OPERATOR_CAUSE) {
+      // Only when the role actually moved, so every row stays an edge really traversed
+      // and the "last taken" highlight keeps meaning something.
+      if (state !== "follower") push("follower", FSM_OPERATOR_CAUSE[e.event], e);
+    } else if (e.event === "became_follower") {
+      const from = (e.role === "leader" || e.role === "candidate") ? e.role : state;
+      // CheckQuorum logs quorum_lost and steps down inside one synchronous block, so an
+      // adjacent pair is a single event. A quorum_lost left over from an earlier tenure
+      // is not, which is why this is a window rather than a flag.
+      const resigned = from === "leader" && quorumLostAt !== null && e.ts - quorumLostAt < 1;
+      push("follower",
+           resigned  ? "CheckQuorum: no majority reachable"
+         : bumped    ? "higher term seen"
+         : from === "candidate" ? "a live leader appeared"
+         : "deposed",
+           e, from);
+      quorumLostAt = null;
+    } else if (e.event === "pre_vote_failed") {
+      // A self-loop, and it must NOT move `state`: the node never left follower.
+      out.push({from: "follower", to: "follower", term: e.term, ts: e.ts,
+                cause: `straw poll lost (${(e.granted || []).length} granted)`});
+    }
+    if (e.term != null) seenTerm = e.term;
+  }
+  return out.reverse().slice(0, limit);   // newest first, like the feed
+}
+
+// Which edge of the drawn diagram a transition is, so the last one taken can be lit.
+function fsmEdge(t) {
+  return t ? `${t.from}->${t.to}` : null;
+}
+/* --- end role automaton ------------------------------------------------------------- */
+
+/* --- ballot and log automata (behaviour pinned by tests/test_dashboard_state_machines.py)
+   A node runs THREE state machines at once, at three different SCOPES, and the role
+   automaton above is only the first of them:
+
+     * role   -- one per NODE.   follower / candidate / leader.
+     * ballot -- one per TERM.   Where this node's single vote went (Fig. 2 rule 6).
+     * log    -- one per INDEX.  appended -> committed -> applied, the pipeline whose
+                 far end is the key/value state machine the card already lists.
+
+   Keeping them apart is not a layout preference. Squashed into one diagram the arrows
+   stop meaning the same thing: "granted" is not a role, and "committed" is not something
+   a NODE is -- it is something an ENTRY is, and one node holds thousands of entries in
+   different stages at the same instant. Three scopes, three diagrams.
+
+   BOTH LIGHT THEIR CURRENT BOX FROM /state, not from the reconstruction. `voted_for`,
+   `commit_index` and `last_applied` are authoritative, already fetched, and free. The
+   role panel's one live bug was precisely a reconstruction that disagreed with the node
+   it was drawn on; where the node can simply be asked, ask it. The log supplies the
+   EDGES and their causes, which /state cannot: a commit_index of 12 does not say whether
+   index 12 arrived by majority or by a leader's word.
+
+   They also check invariants, because a panel drawing these states is already holding
+   the evidence, and each automaton has an edge that must NEVER exist:
+     * one vote per term (5.2). Two grants to different candidates inside one term is a
+       split brain at its source -- upstream of the Election Safety counter, which can
+       only see the two leaders afterwards.
+     * a committed entry is never truncated (5.4.2, State Machine Safety). This is the
+       single failure the whole implementation exists to rule out. */
+
+/* ---- the ballot: one per TERM -------------------------------------------------------
+   `voted_for` is durable, per-term, and write-once: handle_request_vote grants only when
+   `voted_for in (None, candidate_id)`, and _observe_term clears it on a higher term. So
+   the automaton is genuinely three states with no edge between the two spent ones -- and
+   the ABSENCE of a granted -> granted-someone-else edge is the entire content of Fig. 2
+   rule 6, which is why it is worth drawing rather than describing. */
+function ballotState(votedFor, nodeId) {
+  return votedFor == null || votedFor === "" ? "unvoted"
+       : votedFor === nodeId ? "self"
+       : "granted";
+}
+
+function ballotTransitions(events, nodeId, limit = 8) {
+  const mine = (events || [])
+    .filter(e => e && e.node === nodeId && e.ts != null)
+    .slice()
+    .sort((a, b) => a.ts - b.ts);   // oldest-first: every cause is "what happened before"
+  const rows = [];
+  const conflicts = [];
+  let state = "unvoted";
+  let term = null;
+  let castTo = null;   // who THIS term's vote went to; the one-vote-per-term check
+  const push = (to, cause, e) => {
+    rows.push({from: state, to, term: e.term, ts: e.ts, cause});
+    state = to;
+  };
+  for (const e of mine) {
+    // A higher term voids the ballot (_observe_term sets voted_for = None). No event
+    // announces that, so it is inferred from the first event carrying the new term --
+    // which is also exactly when the node itself learned of it. Drawn only when there
+    // was a vote to void: unvoted -> unvoted moved nothing and is not an edge.
+    if (e.term != null && term !== null && e.term > term) {
+      if (state !== "unvoted") {
+        rows.push({from: state, to: "unvoted", term: e.term, ts: e.ts,
+                   cause: `term ${term} ended, ballot cleared`});
+        state = "unvoted";
+      }
+      castTo = null;
+    }
+    if (e.term != null) term = e.term;
+
+    if (e.event === "vote_granted") {
+      // Re-granting to the SAME candidate is legal and routine -- a retried RequestVote
+      // takes the `voted_for === candidate_id` branch. Only a second, DIFFERENT name is
+      // the violation.
+      if (castTo !== null && castTo !== e.candidate) {
+        conflicts.push({term: e.term, ts: e.ts, first: castTo, second: e.candidate});
+      }
+      castTo = e.candidate;
+      push(e.candidate === nodeId ? "self" : "granted", `granted to ${e.candidate}`, e);
+    } else if (e.event === "election_started") {
+      // _start_election increments the term and then writes voted_for = self, so this
+      // event's term is always the term of that self-vote.
+      if (castTo !== null && castTo !== nodeId) {
+        conflicts.push({term: e.term, ts: e.ts, first: castTo, second: nodeId});
+      }
+      castTo = nodeId;
+      push("self", "voted for itself and ran", e);
+    } else if (e.event === "pre_vote_started" || e.event === "pre_vote_failed") {
+      // The straw poll is on this diagram BECAUSE it moves nothing. It persists no vote
+      // and touches no term, so it is a self-loop on whatever state the ballot is in --
+      // including `granted`, which is where a follower sits when the leader it voted for
+      // goes quiet. That is the reason the loop is matched by from === to rather than
+      // pinned under `unvoted`.
+      rows.push({from: state, to: state, term: e.term, ts: e.ts,
+                 cause: e.event === "pre_vote_failed"
+                   ? `straw poll lost (${(e.granted || []).length} granted) · ballot untouched`
+                   : `straw poll for term ${e.would_be_term ?? "?"} · ballot untouched`});
+    } else if (e.event === "reset") {
+      // The wipe destroys the durable vote. Documented in reset()'s own docstring as the
+      // double-vote that Fig. 2's durability requirement exists to prevent, so it is
+      // named here rather than quietly folded into a term change.
+      if (state !== "unvoted") push("unvoted", "state wiped by reset", e);
+      castTo = null;
+    }
+  }
+  return {rows: rows.reverse().slice(0, limit), conflicts};
+}
+
+// The straw-poll loop is one drawn cell serving all three states, so every self-loop maps
+// to it; everything else is an ordinary from->to edge.
+function ballotEdge(t) {
+  return t ? (t.from === t.to ? "poll" : `${t.from}->${t.to}`) : null;
+}
+
+/* ---- the log: one per INDEX ---------------------------------------------------------
+   appended -> committed -> applied, monotone, with exactly one way back out: truncation,
+   and only from `appended`. `last_applied <= commit_index <= last_log_index` holds at
+   every instant, which is what makes three watermarks enough to place every entry.
+
+   A FOLLOWER'S COMMIT IS NOT LOGGED. handle_append_entries advances commit_index from
+   leader_commit without an event, deliberately -- it moves on essentially every append
+   round, and logging it would bury the feed. So the commit edge is reconstructible only
+   on a leader, and `applied` is the follower's evidence instead: applying an entry
+   implies it was committed. Hence `proven` below takes the max of both. */
+function logStage(s) {
+  const len = s.log_length ?? 0;
+  const commit = s.commit_index ?? 0;
+  const applied = s.last_applied ?? 0;
+  if (len === 0) return "empty";   // no entry is in any stage; light nothing
+  if (len > commit) return "appended";
+  if (commit > applied) return "committed";
+  return "applied";
+}
+
+function logTransitions(events, nodeId, limit = 8) {
+  const mine = (events || [])
+    .filter(e => e && e.node === nodeId && e.ts != null)
+    .slice()
+    .sort((a, b) => a.ts - b.ts);
+  const rows = [];
+  const violations = [];
+  let proven = 0;   // highest index this node's OWN log proves was committed
+  const add = (from, to, cause, e, index) =>
+    rows.push({from, to, index, term: e.term, ts: e.ts, cause});
+  for (const e of mine) {
+    if (e.event === "submitted") {
+      add("absent", "appended",
+          `${e.op ?? "write"} "${e.key}" accepted at index ${e.index}`, e, e.index);
+    } else if (e.event === "log_appended") {
+      const n = e.count ?? 0;
+      add("absent", "appended",
+          `${n} ${n === 1 ? "entry" : "entries"} replicated from index ${e.from_index}`,
+          e, e.from_index);
+    } else if (e.event === "log_truncated") {
+      // THE check. Cutting at or below a proven-committed index means an entry a majority
+      // acknowledged, and a client may have been told about, has been erased.
+      if (e.from_index != null && e.from_index <= proven) {
+        violations.push({
+          kind: "a committed entry was truncated",
+          detail: `index ${e.from_index} was cut, but index ${proven} was already committed`,
+          ts: e.ts,
+        });
+      }
+      add("appended", "truncated",
+          `conflict at index ${e.from_index}: cut back and refilled by the leader`,
+          e, e.from_index);
+    } else if (e.event === "commit_advanced") {
+      if (e.commit_index != null) {
+        if (e.commit_index < proven) {
+          violations.push({
+            kind: "commit index moved backwards",
+            detail: `${proven} -> ${e.commit_index}`,
+            ts: e.ts,
+          });
+        }
+        proven = Math.max(proven, e.commit_index);
+      }
+      add("appended", "committed", `a majority holds index ${e.commit_index}`,
+          e, e.commit_index);
+    } else if (e.event === "applied") {
+      if (e.index != null) proven = Math.max(proven, e.index);  // applied implies committed
+      add("committed", "applied", `index ${e.index} -> key "${e.key}"`, e, e.index);
+    } else if (e.event === "reset") {
+      // An operator destroying the log is not Raft violating itself, so the watermark has
+      // to go with it -- otherwise the refill afterwards trips the truncation check on
+      // every conflict and the panel cries safety violation at a documented operation.
+      proven = 0;
+      add("appended", "truncated", "log destroyed by reset", e, 0);
+    }
+  }
+  return {rows: rows.reverse().slice(0, limit), violations};
+}
+
+function logEdge(t) {
+  return t ? `${t.from}->${t.to}` : null;
+}
+
+// Checkable from /state alone, so it holds even when the ring buffer has rolled past
+// every event: the two containments that place every index in exactly one stage.
+function logInvariants(s) {
+  const len = s.log_length ?? 0;
+  const commit = s.commit_index ?? 0;
+  const applied = s.last_applied ?? 0;
+  const bad = [];
+  if (commit > len) {
+    bad.push(`commit_index ${commit} is past the end of the log (${len})`);
+  }
+  if (applied > commit) {
+    bad.push(`last_applied ${applied} is ahead of commit_index ${commit}`);
+  }
+  return bad;
+}
+/* --- end ballot and log automata ---------------------------------------------------- */
 
 /* ================= rendering helpers ================= */
 
@@ -1081,6 +1497,203 @@ function detailsBlock(addr, kind, summary, rows, scrolls) {
   return d;
 }
 
+/* detailsBlock's sibling for a body that is not a table. Same open-state persistence --
+   OPEN_DETAILS is keyed by `${addr}:${kind}` and the card is rebuilt twice a second
+   either way -- and the same lazy build, for the same reason: a collapsed panel that
+   renders anyway is work thrown away 2x/sec x one card per node.
+
+   The childElementCount guard is detailsBlock's hasChildNodes guard wearing a different
+   hat. Assigning `d.open` is itself a change and fires `toggle`, so a handler that
+   rebuilt in response would loop; appending is safe, and the guard makes a second toggle
+   a no-op rather than a doubled diagram. */
+function detailsPanel(addr, kind, summary, build) {
+  const key = `${addr}:${kind}`;
+  const d = document.createElement("details");
+  d.open = OPEN_DETAILS.has(key);
+  d.append(el("summary", "", summary));
+  if (d.open) d.append(build());
+  d.addEventListener("toggle", () => {
+    d.open ? OPEN_DETAILS.add(key) : OPEN_DETAILS.delete(key);
+    if (d.open && d.childElementCount < 2) d.append(build());
+  });
+  return d;
+}
+
+/* The automaton, drawn. Reads `lastLines` -- the feed's own merged event list -- so this
+   costs no extra request: the page already fetches /logs from every node once a tick for
+   the feed, and the transitions are in there. */
+function roleAutomaton(addr, s) {
+  const now = s.role;
+  const history = roleTransitions(lastLines, s.node_id);
+  const took = fsmEdge(history[0]);
+
+  const box = (role, wide) => el(
+    "div",
+    "st" + (wide ? " wide" : "") + (role === now ? " now " + role : ""),
+    role.toUpperCase(),
+  );
+  const edge = (from, to, label, wide) => el(
+    "div",
+    "ed" + (wide ? " wide" : "") + (took === `${from}->${to}` ? " took" : ""),
+    label,
+  );
+
+  // Edges are labelled with the TRANSITION, not with a cause. Four different things send
+  // a leader back to follower -- CheckQuorum, a newer term, a crash, a reset -- and an
+  // edge captioned with two of them is simply wrong the other half of the time, which is
+  // how the crash below first rendered. The specific cause goes on the line underneath,
+  // where there is room to be exact.
+  const g = el("div", "fsm");
+  g.append(
+    box("follower"),
+    edge("follower", "candidate", "campaigns →"),
+    box("candidate"),
+    // The self-loop sits under FOLLOWER because that is where it lands: a lost straw poll
+    // costs no term and no role. See roleTransitions.
+    edge("follower", "follower", "↺ poll lost"),
+    edge("candidate", "follower", "← stands down"),
+    edge("candidate", "leader", "majority ↓"),
+    box("leader", true),
+    edge("leader", "follower", "↑ steps down", true),
+  );
+
+  const wrap = el("div", "sub");
+  wrap.append(g, fsmCaption(history[0], "no role change in the retained log"));
+  return wrap;
+}
+
+
+/* --- automaton rendering (behaviour pinned by tests/test_dashboard_state_machines.py) --
+   The three panels share a drawing vocabulary because they are the same KIND of picture:
+   boxes for states, one of them lit because that is where the node is now, and one edge
+   lit because that is how it got there. What differs is only which machine is being
+   asked, so that is all these two helpers take. */
+function fsmCells(now, took) {
+  return {
+    box: (state, label, wide) => el(
+      "div",
+      "st" + (wide ? " wide" : "") + (state === now ? " here" : ""),
+      label ?? state.toUpperCase(),
+    ),
+    edge: (id, label, wide) => el(
+      "div",
+      "ed" + (wide ? " wide" : "") + (id === took ? " took" : ""),
+      label,
+    ),
+  };
+}
+
+/* The line under a diagram: what the last transition was, in words, with its cause.
+   `empty` is a sentence rather than a blank because /logs is a bounded ring buffer -- a
+   node that has been quietly leading for an hour and one that just booted produce the
+   same absence, and only one of them is "nothing happened". Say which claim is made. */
+function fsmCaption(last, empty) {
+  const line = el("div", "fsm-last");
+  if (!last) {
+    line.append(el("span", "", empty));
+    return line;
+  }
+  const secs = Math.max(0, Math.round(Date.now() / 1000 - last.ts));
+  line.append(
+    el("span", "", `${last.from} → ${last.to} · `),
+    el("b", "", last.cause),
+    el("span", "", ` · term ${last.term} · ${secs}s ago`),
+  );
+  return line;
+}
+
+// Nothing at all when the invariants hold, which is the overwhelmingly common case and
+// the only one where silence is the right output: a permanent "0 violations" badge is
+// something the eye stops reading long before the day it changes.
+function fsmViolations(messages) {
+  if (!messages.length) return null;
+  const box = el("div", "fsm-bad");
+  messages.forEach((m, i) => {
+    if (i) box.append(el("br"));
+    box.append(el("b", "", "! "), el("span", "", m));
+  });
+  return box;
+}
+
+/* The ballot, drawn. Lit from `voted_for` -- durable, authoritative, already on the card
+   -- and edged from the log. */
+function ballotAutomaton(addr, s) {
+  const now = ballotState(s.voted_for, s.node_id);
+  const {rows, conflicts} = ballotTransitions(lastLines, s.node_id);
+  const {box, edge} = fsmCells(now, ballotEdge(rows[0]));
+
+  const g = el("div", "fsm");
+  g.append(
+    box("unvoted", "NO VOTE"),
+    edge("unvoted->granted", "grants →"),
+    box("granted", "GRANTED"),
+    // One drawn loop for all three states: a straw poll leaves the ballot wherever it
+    // was, and a follower whose leader has gone quiet polls from `granted`, not from
+    // `unvoted`. See ballotEdge.
+    edge("poll", "↺ straw poll"),
+    edge("unvoted->self", "campaigns ↓"),
+    edge("granted->unvoted", "← term ends"),
+    box("self", "VOTED FOR ITSELF", true),
+    // The only way out of a spent ballot, and the reason the diagram has no edge from
+    // one spent state to the other: within a term, this vote is already written.
+    edge("self->unvoted", "↑ term ends, ballot cleared", true),
+  );
+
+  const wrap = el("div", "sub");
+  wrap.append(g, fsmCaption(rows[0], "no vote recorded in the retained log"));
+  const bad = fsmViolations(conflicts.map(c =>
+    `two votes in term ${c.term}: ${c.first}, then ${c.second}. One vote per term (§5.2) `
+    + `is what makes two leaders in a term impossible; this is that guarantee breaking.`));
+  if (bad) wrap.append(bad);
+  return wrap;
+}
+
+/* The log, drawn. Three watermarks place every index in exactly one stage, so the boxes
+   carry them: last_applied <= commit_index <= last_log_index, always. */
+function logAutomaton(addr, s) {
+  const now = logStage(s);
+  const {rows, violations} = logTransitions(lastLines, s.node_id);
+  const {box, edge} = fsmCells(now, logEdge(rows[0]));
+  const len = s.log_length ?? 0;
+  const commit = s.commit_index ?? 0;
+  const applied = s.last_applied ?? 0;
+
+  const g = el("div", "fsm");
+  g.append(
+    box("appended", `APPENDED · ${len}`),
+    edge("appended->committed", "majority →"),
+    box("committed", `COMMITTED · ${commit}`),
+    // `absent -> appended` rather than a self-loop: an arriving entry did not exist a
+    // moment ago. There is no box for `absent` because no node ever sits in it -- it is
+    // a property of an index, and the pipeline is what an index moves through.
+    edge("absent->appended", "↓ entries arrive"),
+    edge("appended->truncated", "✂ cut back"),
+    edge("committed->applied", "applier ↓"),
+    box("applied", `APPLIED · ${applied}`, true),
+  );
+
+  const wrap = el("div", "sub");
+  wrap.append(g);
+  // The two gaps, which are the backlog: entries a majority has not acknowledged yet,
+  // and entries the applier has not reached. Both zero is a caught-up node.
+  const gaps = el("div", "fsm-last");
+  gaps.append(
+    el("b", "", `${Math.max(0, len - commit)}`),
+    el("span", "", " awaiting a majority · "),
+    el("b", "", `${Math.max(0, commit - applied)}`),
+    el("span", "", " committed, not yet applied"),
+  );
+  wrap.append(gaps, fsmCaption(rows[0], "no log activity in the retained window"));
+
+  const bad = fsmViolations([
+    ...logInvariants(s),
+    ...violations.map(v => `${v.kind} — ${v.detail}`),
+  ]);
+  if (bad) wrap.append(bad);
+  return wrap;
+}
+/* --- end automaton rendering ------------------------------------------------------- */
+
 /* --- scroll persistence (sliced out and run under node by tests/test_dashboard_keys.py) */
 /* Restore every scroll box to where the user left it. Called immediately after the
    cards are attached, because the whole card subtree is rebuilt twice a second and a
@@ -1157,6 +1770,24 @@ function voterCount(s) {
 
 function infraDetails(addr, s) {
   const wrap = el("div", "sub");
+
+  // First, because a node card is about this node, and its role is the thing that
+  // changes. The summary carries the current state so a collapsed panel still answers
+  // the question; opening it answers "how did it get there".
+  wrap.append(detailsPanel(addr, "fsm", `role · ${s.role}`, () => roleAutomaton(addr, s)));
+
+  // The other two machines this node is running, at the other two scopes. Their summaries
+  // are the same shape as role's: the answer while shut, the derivation once opened.
+  const ballot = ballotState(s.voted_for, s.node_id);
+  wrap.append(detailsPanel(addr, "ballot",
+    `ballot · term ${s.term} · ${ballot === "unvoted" ? "no vote"
+      : ballot === "self" ? "itself" : `→ ${s.voted_for}`}`,
+    () => ballotAutomaton(addr, s)));
+  // Deliberately above `state machine`, which is where this pipeline ends: an entry is
+  // appended, committed, applied, and only then is it a key in the panel below.
+  wrap.append(detailsPanel(addr, "log",
+    `log · ${s.commit_index ?? 0} of ${s.log_length ?? 0} committed`,
+    () => logAutomaton(addr, s)));
 
   const peers = s.peers ?? {}, learners = s.learners ?? {};
   const topo = [row("this node", s.advertise_addr || addr)];
@@ -1296,15 +1927,22 @@ function renderFilters(lines) {
 }
 
 async function refreshLogs() {
-  const lines = [];
-  await Promise.all(NODES.map(async addr => {
+  // One batch per node, flattened in NODES order — Promise.all preserves input order,
+  // so events tied on `ts` (same millisecond; a flood produces hundreds) land the same
+  // way every poll. Pushing into a shared array per-response ordered ties by network
+  // completion instead, which flips between polls: the feed visibly reshuffled twice a
+  // second while nothing was happening.
+  const batches = await Promise.all(NODES.map(async addr => {
     try {
       const r = await fetch(`http://${addr}/logs`, {signal: AbortSignal.timeout(900)});
-      if (r.ok) (await r.json()).forEach(e => lines.push(e));
+      if (r.ok) return await r.json();
     } catch {}
+    return [];
   }));
+  const lines = batches.flat();
   // Newest FIRST: the interesting line is the one that just happened,
-  // and nobody should be scrolling a live feed to find it.
+  // and nobody should be scrolling a live feed to find it. Stable sort, so ties keep
+  // the deterministic node-then-emission order built above.
   lines.sort((a, b) => b.ts - a.ts);
 
   // Replication events since the last poll become pulses on the graph. This is the
@@ -1511,7 +2149,7 @@ async function provisionNode() {
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) {
-      setStatus(`provision failed: ${d.detail ?? d.error ?? r.status}`, "err");
+      setStatus(`provision failed: ${provisionFailureMessage(r.status, d)}`, "err");
       return;
     }
     registerProvisioned(d.addr, PROBE);

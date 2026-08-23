@@ -200,3 +200,31 @@ def test_a_candidate_ignores_a_stale_leader(make_node):
     assert not resp.success
     assert node.role is Role.CANDIDATE
     assert node.leader_id is None
+
+
+def test_commit_index_does_not_regress_when_a_heartbeat_verifies_less_than_it_holds(make_node):
+    """Fig. 2 says commitIndex "increases monotonically" — a floor, not a hope.
+
+    The dangerous branch is the one `test_commit_index_never_moves_backwards` does not
+    reach: leaderCommit is HIGHER than our commit_index (so the `>` guard passes), but the
+    entries this message verifies end BELOW it. That happens on an empty append whose
+    prev_log_index sits under our committed prefix. Without a max() on the RESULT,
+    commit_index drops to prev_log_index and last_applied is left stranded above it —
+    breaking the `last_applied <= commit_index` invariant docs/RAFT.md states as always-true.
+
+    A correct leader never sends this — Leader Completeness keeps its repair walk at or
+    above our committed prefix — but `handle_append_entries` is reachable directly by any
+    peer, and the invariant has to hold on the rule, not on the goodwill of the caller.
+    """
+    node = make_node()
+    node.storage.append([entry(1, "a"), entry(1, "b"), entry(1, "c"), entry(1, "d")])
+    node.current_term = 1
+    node.commit_index = 3
+    node.last_applied = 3
+
+    # leader_commit(9) > commit_index(3), but this heartbeat verifies only up to index 1.
+    resp = node.handle_append_entries(ae(term=1, prev_idx=1, prev_term=1, commit=9))
+
+    assert resp.success
+    assert node.commit_index == 3, "commit_index regressed below what a majority holds"
+    assert node.last_applied <= node.commit_index

@@ -97,10 +97,22 @@ def _containerised() -> bool:
     never connects, and the failure looks like a Raft bug instead of a topology mistake.
 
     Growing a containerised cluster is the orchestrator's job, and both runtimes already
-    have the verb: `docker compose up -d raft-node-N` against a declared service, or
-    `kubectl scale statefulset/raftkv`. Neither belongs behind an unauthenticated button.
+    have the verb: `docker compose up -d raft-node-4` (naming a profiled service starts
+    it dormant-until-asked-for; see docker-compose.yml), or
+    `kubectl scale statefulset/node`. Process spawning never belongs behind an
+    unauthenticated button here. The kubectl verb CAN sit behind the button after all --
+    but as an authenticated, RBAC-bounded API call, which is k8s_provision.py, a
+    different backend behind the same route.
     """
     if pathlib.Path("/.dockerenv").exists():
+        return True
+    # Kubernetes. A containerd pod leaves no /.dockerenv and sets no `container` var,
+    # which was the gap that let a kind pod take this endpoint live: the spawn slipped
+    # past this refusal and died on the pod's read-only root filesystem as an opaque
+    # 500 instead of the 409 that names the right verb. The kubelet injects
+    # KUBERNETES_SERVICE_HOST into every container unconditionally (unlike the
+    # enableServiceLinks-dependent service vars), so it is the reliable tell.
+    if os.getenv("KUBERNETES_SERVICE_HOST") is not None:
         return True
     # Podman, systemd-nspawn and some rootless runtimes leave no /.dockerenv but do set
     # this. Lowercase is not a typo — it is the name those runtimes actually set, so the
@@ -231,8 +243,11 @@ async def spawn(
         raise ProvisionError(
             "this node is running inside a container, where a spawned process would "
             "share its network namespace and be unreachable from its peers. Grow a "
-            "containerised cluster with `docker compose up -d raft-node-N` or "
-            "`kubectl scale statefulset/raftkv` instead."
+            "containerised cluster instead: `docker compose up -d raft-node-4` (or -5; "
+            "past node-5, add a service block first) or "
+            "`kubectl scale statefulset/node --replicas=N` (on Kubernetes, "
+            "RAFT_PROVISION_K8S=1 puts that scale verb behind this button; "
+            "see k8s_provision.py)."
         )
     max_nodes = max(1, min(max_nodes, 90))  # ordinals stay two digits, matching the model
     if ordinal is None:
@@ -257,26 +272,39 @@ async def spawn(
     node_id = f"node-{safe_ordinal}"
     addr = f"127.0.0.1:{port}"
 
-    pathlib.Path("data").mkdir(exist_ok=True)
-    log_root = pathlib.Path(log_dir).resolve()
-    log_root.mkdir(parents=True, exist_ok=True)
-    stdout = (log_root / f"node-{safe_ordinal}.stdout").resolve()
     try:
-        stdout.relative_to(log_root)
-    except ValueError as exc:
-        raise ProvisionError("resolved log path escapes configured log_dir") from exc
+        pathlib.Path("data").mkdir(exist_ok=True)
+        log_root = pathlib.Path(log_dir).resolve()
+        log_root.mkdir(parents=True, exist_ok=True)
+        stdout = (log_root / f"node-{safe_ordinal}.stdout").resolve()
+        try:
+            stdout.relative_to(log_root)
+        except ValueError as exc:
+            raise ProvisionError("resolved log path escapes configured log_dir") from exc
 
-    with stdout.open("ab") as sink:
-        child = await asyncio.create_subprocess_exec(
-            *_argv(port),
-            env=_child_env(node_id, addr, str(log_root)),
-            stdout=sink,
-            stderr=asyncio.subprocess.STDOUT,
-            # Its own session, so it survives whatever kills this node's shell. A staged
-            # node dying with its parent would make `provision` look flaky in exactly the
-            # situation it exists for -- a session where the operator restarts node-1.
-            start_new_session=True,
-        )
+        with stdout.open("ab") as sink:
+            child = await asyncio.create_subprocess_exec(
+                *_argv(port),
+                env=_child_env(node_id, addr, str(log_root)),
+                stdout=sink,
+                stderr=asyncio.subprocess.STDOUT,
+                # Its own session, so it survives whatever kills this node's shell. A
+                # staged node dying with its parent would make `provision` look flaky in
+                # exactly the situation it exists for -- a session where the operator
+                # restarts node-1.
+                start_new_session=True,
+            )
+    except OSError as exc:
+        # A refusal, not a bug. Everything on this path -- the data dir, the log sink,
+        # the exec itself -- is a statement about the host, and a host that denies them
+        # (a read-only root filesystem, an unwritable working directory) is one that
+        # should grow through its orchestrator. Unmapped, this OSError became the 500
+        # a cross-origin dashboard tab renders as `TypeError: Failed to fetch`.
+        raise ProvisionError(
+            f"the filesystem refused what a new node needs ({exc}); a read-only or "
+            "unwritable working directory usually means an orchestrated or hardened "
+            "deployment, which should grow through its orchestrator instead"
+        ) from exc
     _children[ordinal] = child
 
     try:

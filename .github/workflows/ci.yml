@@ -109,6 +109,17 @@ jobs:
       - name: install
         run: uv sync --all-extras --frozen
 
+      - name: install the e2e browser
+        # Same trap as node above, one layer higher: the e2e lane
+        # (tests/test_e2e_provision_dashboard.py) skips wherever the environment cannot
+        # carry it — no playwright, no chromium, no bindable sockets — and a runner
+        # without chromium reports success with the only layer that sees what the
+        # operator sees quietly missing. playwright is deliberately NOT a project
+        # dependency (`make e2e` runs it ephemerally via `uv run --with`; keep the
+        # version pinned in both places), so the browser is installed here the same
+        # way. Installing is half the fix; `no test may skip` below is the other half.
+        run: uv run --with playwright==1.62.0 playwright install --with-deps chromium
+
       - name: pytest
         # -o addopts="" drops the project's own -q. Adding a second -q gives -qq, which
         # suppresses the pass/fail summary line — the one line CI logs exist for.
@@ -122,12 +133,14 @@ jobs:
         # suite to tolerate the behaviour it exists to catch.
         env:
           RAFT_TEST_TIMING_SCALE: "4"
-        run: uv run pytest -o addopts="" -rs --junit-xml=junit.xml
+        run: uv run --with playwright==1.62.0 pytest -o addopts="" -rs --junit-xml=junit.xml
 
       - name: no test may skip
         # A skip is how a whole layer of this suite disappears without anything going
-        # red. There is exactly one conditional skip in the repo (node absent), the step
-        # above removes that condition, and this asserts the removal worked.
+        # red. Every conditional skip in the repo names an environment defect — node
+        # absent, playwright absent, sockets unbindable, the host itself a container —
+        # and the steps above remove every one of them on this runner, so this asserts
+        # the removals worked.
         run: |
           python3 - <<'PY'
           import sys, xml.etree.ElementTree as ET

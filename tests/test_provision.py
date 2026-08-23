@@ -17,6 +17,7 @@ environment — because that is the part with the bugs in it.
 """
 
 import asyncio
+import pathlib
 
 import pytest
 from fastapi.testclient import TestClient
@@ -113,6 +114,72 @@ async def test_it_refuses_inside_a_container(spawned, monkeypatch, tmp_path):
     with pytest.raises(ProvisionError, match="container"):
         await provision.spawn(log_dir=str(tmp_path))
     assert spawned == [], "refused, but spawned anyway"
+
+
+async def test_the_refusal_names_commands_that_exist(spawned, monkeypatch, tmp_path):
+    """The regression that shipped: the refusal advertised `docker compose up -d
+    raft-node-N` while `make demo` started every service in the file — a verb that was a
+    silent no-op for the two staged nodes and `no such service` past them. This message
+    is the only guidance the compose operator gets, so pin it to the two verbs that
+    actually work: naming a profiled service (docker-compose.yml activates its profile
+    implicitly) and scaling the StatefulSet by its real name, `node`."""
+    monkeypatch.setattr(provision, "_containerised", lambda: True)
+    with pytest.raises(ProvisionError) as refusal:
+        await provision.spawn(log_dir=str(tmp_path))
+    assert "docker compose up -d raft-node-4" in str(refusal.value)
+    assert "statefulset/node" in str(refusal.value)
+    assert "statefulset/raftkv" not in str(refusal.value), "the pre-rename name came back"
+
+
+# The two tests below run the REAL _containerised(), which fires on /.dockerenv — so on
+# a host that is itself a container (a devcontainer CI runner) they would fail for the
+# host's reason, not the code's. Same guard the e2e lane carries.
+NOT_A_CONTAINER = pytest.mark.skipif(
+    pathlib.Path("/.dockerenv").exists(),
+    reason="the host is itself a container; the real _containerised() fires for its reason",
+)
+
+
+@NOT_A_CONTAINER
+def test_a_kubernetes_pod_counts_as_containerised(monkeypatch):
+    """The gap that shipped: a containerd pod leaves no /.dockerenv and sets no
+    `container` var, so a kind pod sailed past this check and the spawn died on the
+    pod's read-only root filesystem as an opaque 500 instead of this refusal's 409.
+    KUBERNETES_SERVICE_HOST is injected by the kubelet into every container
+    unconditionally, which makes it the tell — asserted directly against
+    `_containerised` because the `spawned` fixture stubs it out."""
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.delenv("container", raising=False)
+    assert provision._containerised() is False, "a bare host must still be allowed"
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+    assert provision._containerised() is True
+
+
+async def test_a_kubernetes_pod_gets_the_same_refusal(monkeypatch, tmp_path):
+    """Through the real `_containerised` — no `spawned` fixture here, because it
+    replaces the very function under test. The env var alone must be enough to get the
+    409 that names `kubectl scale statefulset/node`, before any filesystem work."""
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+    with pytest.raises(ProvisionError, match="statefulset/node"):
+        await provision.spawn(log_dir=str(tmp_path))
+
+
+async def test_filesystem_errors_become_refusals_not_500s(spawned, monkeypatch, tmp_path):
+    """Where the k8s pod that slipped past the old container check actually died:
+    `data` mkdir on a read-only root filesystem raised OSError, which nothing mapped, so
+    the endpoint answered an opaque 500 — invisible to a cross-origin dashboard tab
+    (docs/FAILURE_MODES.md). Every OSError on the spawn path is a fact about the host
+    the operator can act on, so it must surface as the readable 409 refusal."""
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    monkeypatch.chdir(ro)
+    try:
+        with pytest.raises(ProvisionError, match="filesystem refused"):
+            await provision.spawn(log_dir=str(tmp_path / "logs"))
+    finally:
+        ro.chmod(0o700)  # or pytest cannot clean its own tmp tree
+    assert not (ro / "data").exists(), "refused, but wrote anyway"
 
 
 async def test_the_bootstrap_cluster_is_off_limits(spawned, tmp_path):
@@ -245,6 +312,26 @@ def test_the_endpoint_reports_refusal_as_409(tmp_path, monkeypatch):
         r = c.post("/admin/spawn-node", json={})
         assert r.status_code == 409
         assert "container" in r.json()["detail"]
+
+
+@NOT_A_CONTAINER
+def test_the_endpoint_reports_a_filesystem_refusal_as_409_too(tmp_path, monkeypatch):
+    """The full HTTP shape of the k8s incident, minus kubernetes: an unwritable working
+    directory used to escape as `{"error": "internal"}`. The detail must be the
+    ProvisionError text, which is written to be shown to whoever pressed the button."""
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.delenv("container", raising=False)
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    monkeypatch.chdir(ro)
+    try:
+        with TestClient(create_app(build_cfg(tmp_path))) as c:
+            r = c.post("/admin/spawn-node", json={})
+            assert r.status_code == 409
+            assert "filesystem refused" in r.json()["detail"]
+    finally:
+        ro.chmod(0o700)
 
 
 def test_an_out_of_range_ordinal_never_reaches_the_module(tmp_path):

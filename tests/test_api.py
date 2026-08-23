@@ -181,6 +181,37 @@ def test_healthz_reports_503_once_a_background_loop_has_died(client):
     assert "_apply_loop" in response.json()["detail"]
 
 
+def test_livez_reports_503_for_the_same_dead_loop(client):
+    """The other half of the probe split. /livez exists so the kubelet does NOT restart
+    a deliberately-killed node (tests/test_admin_failure.py pins that half), and the one
+    thing the split must not soften is the case liveness was added for: a dead apply
+    loop, which nothing inside the process can restart. Same arrangement as the /healthz
+    test above — the applier is killed the way a full disk would kill it — pinned
+    separately so weakening /livez to a bare 200 cannot hide behind /healthz's coverage."""
+    node = client.app.state.node
+    wait_for_leader(client)
+    assert client.get("/livez").status_code == 200
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    node.storage.apply = boom
+    node.storage.advance_applied = boom
+    node.commit_index = node.storage.last_log_index() + 1
+    node.last_applied = 0
+    node._apply_ready.set()
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and node.degraded is None:
+        time.sleep(0.02)
+    assert node.degraded == "solo:_apply_loop", (
+        f"the applier did not die as arranged (degraded={node.degraded!r})"
+    )
+    response = client.get("/livez")
+    assert response.status_code == 503
+    assert "_apply_loop" in response.json()["detail"]
+
+
 def test_a_cancelled_task_is_not_degraded(client):
     """`stop()` cancels every loop, so treating cancellation as failure would make a node
     report unhealthy on the way down and, worse, make the check meaningless."""
@@ -415,3 +446,9 @@ def test_unhandled_exception_returns_structured_500(tmp_path):
         r = c.get("/boom")
         assert r.status_code == 500
         assert r.json() == {"error": "internal"}
+        assert r.headers["access-control-allow-origin"] == "*", (
+            "the generic 500 is sent from ServerErrorMiddleware, OUTSIDE the"
+            " CORSMiddleware every routed response passes through — without this header"
+            " a cross-origin dashboard tab cannot read the response at all and reports"
+            " the exchange as `TypeError: Failed to fetch` (docs/FAILURE_MODES.md)"
+        )

@@ -94,9 +94,9 @@ def unattached(node_id):
 
 
 def test_a_process_in_no_configuration_is_staged_not_a_member():
-    """The distinction this split exists to draw: `docker compose up` provisions a process,
-    and a process is not a cluster member until a leader appends a configuration entry
-    naming it."""
+    """The distinction this split exists to draw: `docker compose up -d raft-node-4`
+    provisions a process, and a process is not a cluster member until a leader appends a
+    configuration entry naming it."""
     got = run(CLUSTER + STAGING,
               {**{a: member(f"node-{a[-1]}") for a in CLUSTER},
                **{a: unattached(f"node-{a[-1]}") for a in STAGING}})

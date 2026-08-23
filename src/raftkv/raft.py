@@ -76,6 +76,12 @@ class RaftNode:
         # entire input to CheckQuorum: a leader that no longer hears back from a majority
         # has already lost the election it does not know about yet. See _check_quorum.
         self._last_contact: dict[str, float] = {}
+        # The mirror image, and a FOLLOWER's clock: when this node last heard an
+        # AppendEntries from the leader it believes in. The PreVote lease is the only
+        # reader (see _handle_pre_vote). It is deliberately NOT `_last_reset`, which
+        # answers a different question -- see there. 0.0 is "never", which reads as a
+        # lapsed lease, which is what a node that has heard from nobody should offer.
+        self._last_heard_from_leader = 0.0
         self.crashed = False                    # simulated failure; see crash()
         self.blocked: set[str] = set()          # simulated partition; see set_blocked()
         self._tasks: list[asyncio.Task] = []
@@ -170,9 +176,15 @@ class RaftNode:
         """Rule 4 (§5.1): a higher term in ANY request or response deposes us.
         Runs BEFORE the handler's own logic (Students' Guide)."""
         if term > self.current_term:
+            # Persist BEFORE mutating memory (Fig. 2: "updated on stable storage before
+            # responding to RPCs"). Memory-first meant that any write which raised — a full
+            # disk, or a value the DB cannot hold — left this node answering RPCs with a
+            # term no restart remembers, free to vote a second time in a term it had already
+            # voted in. The wire bounds (models.MAX_WIRE_INT) stop the value that first
+            # exposed this; the ordering stops every other reason a write can fail.
+            self.storage.save_term_and_vote(term, None)  # rule 1: persist first, literally
             self.current_term = term
             self.voted_for = None
-            self.storage.save_term_and_vote(term, None)  # rule 1: persist first
             self.leader_id = None
             self._become_follower()
 
@@ -199,8 +211,8 @@ class RaftNode:
         may_vote = self.voted_for in (None, req.candidate_id)  # rule 6: one vote/term
         if not (up_to_date and may_vote):  # rule 2: §5.4.1 election restriction
             return RequestVoteResponse(term=self.current_term, vote_granted=False)
+        self.storage.save_term_and_vote(self.current_term, req.candidate_id)  # rule 1: disk first
         self.voted_for = req.candidate_id
-        self.storage.save_term_and_vote(self.current_term, req.candidate_id)  # rule 1
         self._reset_election_timer()  # granting a vote: legal reset
         self.metrics.votes_granted += 1
         self._log("vote_granted", candidate=req.candidate_id)
@@ -244,10 +256,28 @@ class RaftNode:
         The lease is checked ONLY here, never on the real-vote path. `/admin/campaign` is
         this repo's stand-in for leadership transfer, and the paper's TimeoutNow bypasses
         PreVote for the same reason (§3.10): a transfer is the operator deposing a *healthy*
-        leader on purpose, which is precisely what the lease is built to refuse."""
+        leader on purpose, which is precisely what the lease is built to refuse.
+
+        The clock is `_last_heard_from_leader`, NOT `_last_reset`, and the distinction is
+        the whole correctness of the lease. `_last_reset` answers "when should my election
+        timer next fire", and three different events legitimately push it forward: hearing
+        from the leader, granting a vote, and STARTING AN ELECTION OF OUR OWN
+        (`_start_election` resets before it polls, deliberately, so a failed poll costs a
+        full timeout). Read as a lease, that last one is a node citing its own campaign as
+        proof that the leader is alive -- so every follower that has just campaigned
+        refuses every follower that campaigns next, and they suppress one another for as
+        long as they both keep trying.
+
+        Measured on a live four-voter cluster on 2026-08-19: killing the leader left it
+        with NO leader for ~45 s, three of four voters up and every log identical, while
+        nodes 2 and 4 each burned eleven consecutive straw polls that the other refused.
+        An even voter set is what made it visible rather than merely slow -- a candidate
+        there needs two grants rather than one, so the chance of catching every peer
+        outside its own self-renewed lease in the same round is squared."""
         lease_intact = self.role is Role.LEADER or (
             self.leader_id is not None
-            and time.monotonic() - self._last_reset < self.cfg.election_timeout_min
+            and time.monotonic() - self._last_heard_from_leader
+            < self.cfg.election_timeout_min
         )
         granted = (
             self.is_voter                      # a non-member's opinion is not counted
@@ -269,6 +299,10 @@ class RaftNode:
         if self.role is Role.CANDIDATE:
             self._become_follower()
         self._reset_election_timer()  # AppendEntries from current leader: legal reset
+        # The ONLY event that means "the leader is alive". Recorded separately from the
+        # election timer because the two questions have different answers: see
+        # _handle_pre_vote's lease.
+        self._last_heard_from_leader = time.monotonic()
         # Rule 5 (§5.3): consistency check — heartbeats run it too.
         if self.storage.term_at(req.prev_log_index) != req.prev_log_term:
             return self._consistency_failure(req.prev_log_index)
@@ -290,7 +324,15 @@ class RaftNode:
         # Fig. 2 step 5: only trust leaderCommit as far as entries we just verified.
         if req.leader_commit > self.commit_index:
             last_new_entry = req.prev_log_index + len(req.entries)
-            self.commit_index = min(req.leader_commit, last_new_entry)
+            # max() guards the RESULT, not just the incoming value: a heartbeat whose
+            # prev_log_index sits below our commit_index (empty entries, high leaderCommit)
+            # would otherwise drop commit_index to last_new_entry and strand last_applied
+            # above it, breaking the last_applied <= commit_index invariant. A correct
+            # leader cannot produce it — Leader Completeness keeps its repair walk at or
+            # above our committed prefix — but this receiver rule is reachable directly by
+            # any peer, and Fig. 2 states commitIndex "increases monotonically" as an
+            # invariant, not a hope. etcd guards it the same way (raftLog.commitTo).
+            self.commit_index = max(self.commit_index, min(req.leader_commit, last_new_entry))
             self._apply_ready.set()
         return AppendEntriesResponse(term=self.current_term, success=True)
 
@@ -446,10 +488,14 @@ class RaftNode:
             # have since been elected in, must not restart an election.
             if self.current_term != term_before or self.role is not role_before:
                 return
+        # Persist the incremented term and self-vote BEFORE campaigning on them: a node
+        # that sent RequestVotes at a term it never wrote to disk could, after a crash and
+        # restart at the old term, vote again in this same term.
+        next_term = self.current_term + 1
+        self.storage.save_term_and_vote(next_term, self.cfg.node_id)  # rule 1: disk first
         self.role = Role.CANDIDATE
-        self.current_term += 1
+        self.current_term = next_term
         self.voted_for = self.cfg.node_id
-        self.storage.save_term_and_vote(self.current_term, self.voted_for)  # rule 1
         self.leader_id = None
         self._reset_election_timer()  # starting an election: legal reset
         self.metrics.elections_started += 1
@@ -623,10 +669,24 @@ class RaftNode:
         # uncommitted config entry from an earlier term cannot otherwise tell whether
         # that entry is committed, and acting on the guess is how you get two leaders.
         self._reload_config()  # a truncation may have moved us; re-derive before leading
+        # Reset match_index to its Figure-2 initial value (0 for every peer) BEFORE
+        # appending the no-op — because appending it runs _advance_commit_index, and that
+        # scan must not count a PRIOR tenure's match_index. It is not enough that stale
+        # values usually point below the no-op and die on the §5.4.2 current-term guard: a
+        # leader deposed with match_index[p]=k, whose own log is then truncated and refilled
+        # to length k-1 (which §5.4.1's term-first vote positively allows — a node still
+        # holding the old prefix can elect a leader whose shorter, higher-term log conflicts
+        # with it), appends its no-op at exactly index k. The scan then counts those stale
+        # k's as replicas of the no-op and commits an entry only THIS node holds: a State
+        # Machine Safety violation with a durable, acknowledged-write-losing repro
+        # (docs/FAILURE_MODES.md table 1c; test_a_stale_match_index_at_the_noop_index_does
+        # _not_commit). etcd resets progress in reset() before appendEntry for the same
+        # reason. next_index carries no such hazard — it only chooses where to START
+        # sending — so it stays below, computed from the post-no-op last index.
+        self.match_index = {p: 0 for p in self._replication_targets()}
         self._noop_index = self._leader_append(NoOp())
         last = self.storage.last_log_index()
         self.next_index = {p: last + 1 for p in self._replication_targets()}
-        self.match_index = {p: 0 for p in self._replication_targets()}
         # Seed CheckQuorum with "everyone was here just now". An unseeded map reads as a
         # cluster nobody has ever answered, so the first _check_quorum would depose a
         # leader elected a millisecond ago -- and it would do it every time, which is not a

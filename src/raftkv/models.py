@@ -23,6 +23,23 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # second constant that merely happens to match is the drift this avoids.
 MAX_ENTRIES_PER_APPEND = 512
 
+# The largest integer SQLite can store in an INTEGER column: signed 64-bit. Terms and log
+# indices are all persisted there (storage.py), and the driver raises OverflowError on
+# anything past it — AFTER _observe_term has already assigned it to current_term in memory,
+# which diverges the in-memory term from stable storage (a Figure 2 violation) on a single
+# unauthenticated request, and then propagates: a legit leader reads that term off the
+# reply, fails to persist it too, and its replication loop dies. Every wire-reachable
+# term/index field is bounded to this range so the value is refused at the trust boundary,
+# before any rule method runs. `ge=0` because terms and indices are counts — a negative one
+# has no meaning and would walk next_index off the bottom of the log.
+MAX_WIRE_INT = 2**63 - 1
+
+# The two RPC endpoints are UNAUTHENTICATED (same reason `entries` is bounded, below), so
+# every id they carry is attacker-controlled and some are PERSISTED — request_id lands in a
+# follower's log, 512 per request. Bounded to the same ceiling as Command.key so the RPC
+# surface has no unbounded string left on it.
+MAX_ID_LEN = 256
+
 
 class Role(StrEnum):
     FOLLOWER = "follower"
@@ -38,12 +55,14 @@ class Command(BaseModel):
     op: Literal["set", "delete"]
     key: str = Field(min_length=1, max_length=256)
     value: str | None = Field(default=None, max_length=4096)
+    # request_id is persisted into every follower's log, 512 per unauthenticated request;
+    # bounded like the other identifiers so the RPC surface carries no unbounded string.
     # Minted SERVER-side (app.py, uuid4) — the API exposes no way for a client to supply
     # one. So it cannot deduplicate a client retry even in principle: two retries of the
     # same logical write carry different ids by construction. Its one job is detecting a
     # log index reused by a different leader (Students' Guide, "re-appearing index").
     # Exactly-once would need client sessions; see FAILURE_MODES.md table 2.
-    request_id: str
+    request_id: str = Field(min_length=1, max_length=MAX_ID_LEN)
 
     @model_validator(mode="after")
     def _set_requires_value(self) -> Self:
@@ -93,17 +112,17 @@ class ClusterConfig(BaseModel):
 class LogEntry(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    term: int
+    term: int = Field(ge=0, le=MAX_WIRE_INT)
     # Discriminated on `op`, so a log row round-trips back to the right type. Config
     # entries share the log with client commands precisely so ordering is total.
     command: Command | ClusterConfig | NoOp = Field(discriminator="op")
 
 
 class RequestVoteRequest(BaseModel):
-    term: int
-    candidate_id: str
-    last_log_index: int
-    last_log_term: int
+    term: int = Field(ge=0, le=MAX_WIRE_INT)
+    candidate_id: str = Field(min_length=1, max_length=MAX_ID_LEN)
+    last_log_index: int = Field(ge=0, le=MAX_WIRE_INT)
+    last_log_term: int = Field(ge=0, le=MAX_WIRE_INT)
     # PreVote (thesis §9.6): a straw poll, not a candidacy. `term` is then the term the
     # sender WOULD run in — one above its own — and the receiver must not treat it as an
     # observed term, because the whole purpose is to find out whether running is worth the
@@ -118,10 +137,10 @@ class RequestVoteResponse(BaseModel):
 
 
 class AppendEntriesRequest(BaseModel):
-    term: int
-    leader_id: str
-    prev_log_index: int
-    prev_log_term: int
+    term: int = Field(ge=0, le=MAX_WIRE_INT)
+    leader_id: str = Field(min_length=1, max_length=MAX_ID_LEN)
+    prev_log_index: int = Field(ge=0, le=MAX_WIRE_INT)
+    prev_log_term: int = Field(ge=0, le=MAX_WIRE_INT)
     # Bounded because `/raft/append-entries` is UNAUTHENTICATED. Every entry was already
     # bounded (`Command.key` 256, `Command.value` 4096) and the list was not, so the size
     # of one request was capped only by how many entries a caller cared to put in it —
@@ -136,7 +155,7 @@ class AppendEntriesRequest(BaseModel):
     entries: list[LogEntry] = Field(
         default_factory=list, max_length=MAX_ENTRIES_PER_APPEND
     )
-    leader_commit: int
+    leader_commit: int = Field(ge=0, le=MAX_WIRE_INT)
 
 
 class AppendEntriesResponse(BaseModel):

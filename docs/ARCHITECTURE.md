@@ -79,9 +79,9 @@ CPU speed. The number is a payload budget (roughly 50 KiB a message), not a tuni
 Owns the HTTP surface: `create_app()` (uvicorn `--factory`) wires config → logging →
 storage → transport → `RaftNode` inside a `lifespan` context. Endpoints: the two Raft
 RPCs, the KV API (`PUT`/`GET`/`DELETE /kv/{key}`), `GET /state`, `GET /logs`,
-`GET /healthz`, `GET /build`, and `/` serving the dashboard. Exception handlers translate
-`NotLeaderError` → **503 + `leader_id`**, commit `TimeoutError` → 504, validation →
-422, everything else → a structured 500.
+`GET /healthz`, `GET /livez`, `GET /build`, and `/` serving the dashboard. Exception
+handlers translate `NotLeaderError` → **503 + `leader_id`**, commit `TimeoutError` →
+504, validation → 422, everything else → a structured 500.
 
 ### `build.py`
 Owns the two build stamps, and they are two rather than one because the layers reload
@@ -179,7 +179,11 @@ binds the specific address `127.0.0.1:8001` while compose publishes the wildcard
 one a tab talks to. Override with `?nodes=host:port,...`.
 
 The event feed is sorted **newest first** — a live feed that appends at the bottom
-makes you scroll to find the line that just happened. Events are tinted
+makes you scroll to find the line that just happened. Ties are ordered too: a flood
+stamps hundreds of events into the same millisecond, and while tied events sat in
+whatever order the nodes' responses arrived, the feed visibly reshuffled twice a second
+at rest — so each poll now merges the per-node batches in fixed `NODES` order before the
+stable newest-first sort (`tests/test_dashboard_feed_order.py`). Events are tinted
 by class (replication, election, failure) rather than by node, because what happened
 matters more than where when you are following a running cluster.
 
@@ -246,8 +250,9 @@ which nothing replicates to. Ordinals start at 4 and walk upward to
 `RAFT_PROVISION_MAX`, so the staged row is empty until someone asks for it. Refused
 inside a container, where the child would share the node's network namespace and
 advertise an address that resolves, for every peer, to that peer's own loopback — compose
-therefore keeps `raft-node-4`/`raft-node-5` pre-declared instead, and Kubernetes grows
-through `kubectl scale`.
+therefore keeps `raft-node-4`/`raft-node-5` declared but dormant behind a profile
+(`docker compose up -d raft-node-4` starts one), and Kubernetes grows through
+`kubectl scale`.
 
 **add node (learner)** is the second half: it attaches a process that is already running
 but idle. The dashboard first asks the newcomer for its `node_id` and `advertise_addr` —
@@ -352,14 +357,14 @@ flowchart TB
     p1 <--> p3
     p2 <--> p3
   end
-  note[k8s variant: pods raftkv-0/1/2, peer DNS raftkv-N.raftkv-hl:8000,
+  note[k8s variant: pods node-1/2/3, peer DNS node-N.raftkv-hl:8000,
        reached from the host via kubectl port-forward] -.- host
 ```
 
 The browser reaches each container only through its published localhost port
 (8001–8003) and polls all three nodes cross-origin (CORS). Node-to-node Raft RPCs use
 the compose service names (`raft-node-1:8000`, …) on the internal network; the K8s
-variant uses the headless service's stable DNS (`raftkv-0.raftkv-hl:8000`). **This
+variant uses the headless service's stable DNS (`node-1.raftkv-hl:8000`). **This
 topology is why a follower answers a write with 503 + `leader_id` instead of a
 redirect** (decision D14, [OVERVIEW.md](OVERVIEW.md)): a `Location: http://raft-node-2:8000/...` redirect points at a
 Docker-internal hostname the browser cannot resolve — a guaranteed failure.

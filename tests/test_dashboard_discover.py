@@ -39,8 +39,8 @@ def discovery_source() -> str:
     return page[start:end]
 
 
-def run(*, nodes, probe, answers, states=None, delays=None) -> list[str]:
-    """Run one discovery tick and return NODES afterwards.
+def run(*, nodes, probe, answers, states=None, delays=None) -> dict[str, list[str]]:
+    """Run one discovery tick and return {"nodes": NODES, "probe": PROBE} afterwards.
 
     `answers` are the addresses a /state request succeeds on; `delays` maps an address to
     how many milliseconds it takes to answer, which is what lets a test force a specific
@@ -79,9 +79,18 @@ function adoptableAddrs(states, nodes) {{
   return found;
 }}
 
+// probeSuccessor is a sibling block (the probe-list ladder, pinned by
+// tests/test_dashboard_probe.py); discovery only needs it to be callable here.
+const LADDER_TOP = 8012;
+function probeSuccessor(addr) {{
+  const m = /^127\\.0\\.0\\.1:(\\d+)$/.exec(addr);
+  if (!m || Number(m[1]) >= LADDER_TOP) return null;
+  return `127.0.0.1:${{Number(m[1]) + 1}}`;
+}}
+
 {discovery_source()}
 await discover();
-console.log(JSON.stringify(NODES));
+console.log(JSON.stringify({{nodes: NODES, probe: PROBE}}));
 """
     out = subprocess.run(
         ["node", "--input-type=module", "-e", script],
@@ -96,7 +105,7 @@ def test_probe_order_survives_replies_arriving_backwards():
     reshuffle. NODES must still come back ascending, because PROBE is ascending."""
     got = run(nodes=list(CLUSTER), probe=list(PROBE), answers=PROBE,
               delays={"127.0.0.1:8004": 60, "127.0.0.1:8005": 30, "127.0.0.1:8006": 0})
-    assert got == CLUSTER + PROBE, "staged cards ordered by who answered first"
+    assert got["nodes"] == CLUSTER + PROBE, "staged cards ordered by who answered first"
 
 
 def test_order_is_the_same_when_replies_arrive_forwards():
@@ -106,14 +115,14 @@ def test_order_is_the_same_when_replies_arrive_forwards():
                     delays={"127.0.0.1:8004": 60, "127.0.0.1:8006": 0})
     forwards = run(nodes=list(CLUSTER), probe=list(PROBE), answers=PROBE,
                    delays={"127.0.0.1:8004": 0, "127.0.0.1:8006": 60})
-    assert backwards == forwards == CLUSTER + PROBE
+    assert backwards["nodes"] == forwards["nodes"] == CLUSTER + PROBE
 
 
 def test_an_address_with_nothing_there_is_not_adopted():
     """A probe slot for a node that was never started must leave no card behind — it is
     an address that might be nothing, not a node that has gone quiet."""
     got = run(nodes=list(CLUSTER), probe=list(PROBE), answers=["127.0.0.1:8004"])
-    assert got == [*CLUSTER, "127.0.0.1:8004"]
+    assert got["nodes"] == [*CLUSTER, "127.0.0.1:8004"]
 
 
 def test_an_address_is_never_adopted_twice():
@@ -121,8 +130,8 @@ def test_an_address_is_never_adopted_twice():
     would poll the same node N times per tick and grow the list without bound."""
     already = [*CLUSTER, "127.0.0.1:8004"]
     got = run(nodes=already, probe=list(PROBE), answers=PROBE)
-    assert got == [*CLUSTER, "127.0.0.1:8004", "127.0.0.1:8005", "127.0.0.1:8006"]
-    assert len(got) == len(set(got))
+    assert got["nodes"] == [*CLUSTER, "127.0.0.1:8004", "127.0.0.1:8005", "127.0.0.1:8006"]
+    assert len(got["nodes"]) == len(set(got["nodes"]))
 
 
 def test_members_are_adopted_from_the_configuration_before_probing():
@@ -131,5 +140,48 @@ def test_members_are_adopted_from_the_configuration_before_probing():
     twice on the same tick."""
     states = {CLUSTER[0]: {"config": {"voters": {"node-4": "127.0.0.1:8004"}}}}
     got = run(nodes=list(CLUSTER), probe=list(PROBE), answers=PROBE, states=states)
-    assert got == [*CLUSTER, "127.0.0.1:8004", "127.0.0.1:8005", "127.0.0.1:8006"]
-    assert len(got) == len(set(got)), "a configured member was also probed in"
+    assert got["nodes"] == [*CLUSTER, "127.0.0.1:8004", "127.0.0.1:8005", "127.0.0.1:8006"]
+    assert len(got["nodes"]) == len(set(got["nodes"])), "a configured member was also probed in"
+
+
+def test_an_answering_rung_earns_a_knock_on_the_next_port():
+    """The reload path for a cluster grown past the default probe list: 8005 answered,
+    so next tick may knock on 8006 — one rung per tick is what climbs a fresh page back
+    up to node-8 with no query string. (8004's successor is 8005, already listed.)"""
+    got = run(nodes=list(CLUSTER), probe=["127.0.0.1:8004", "127.0.0.1:8005"],
+              answers=["127.0.0.1:8004", "127.0.0.1:8005"])
+    assert got["probe"] == ["127.0.0.1:8004", "127.0.0.1:8005", "127.0.0.1:8006"]
+    assert len(got["probe"]) == len(set(got["probe"]))
+
+
+def test_a_silent_rung_earns_nothing():
+    """An address that never answered proves nothing about its neighbour: pushing its
+    successor anyway would unroll the whole ladder to 8012 on the first tick, and every
+    empty slot becomes a refused fetch twice a second for the rest of the session."""
+    got = run(nodes=list(CLUSTER), probe=["127.0.0.1:8004", "127.0.0.1:8005"], answers=[])
+    assert got["probe"] == ["127.0.0.1:8004", "127.0.0.1:8005"]
+
+
+def test_a_promoted_member_does_not_break_the_ladder():
+    """Local runtime: provision 4-6, promote node-6 to voter, reload. The member's
+    loopback addr arrives through adoptableAddrs() BEFORE the probe map runs, so it
+    never answers a probe fetch — but its rung must still hold, or the staged node-7
+    above it is invisible on every reload. Two ticks, both load-bearing: the first
+    must push 8006 into PROBE even though it is already a member card, the second
+    must count that card as answering and climb on to 8007."""
+    member = "127.0.0.1:8006"
+    tick1 = run(nodes=[*CLUSTER, member], probe=["127.0.0.1:8004", "127.0.0.1:8005"],
+                answers=["127.0.0.1:8004", "127.0.0.1:8005"])
+    assert tick1["probe"] == ["127.0.0.1:8004", "127.0.0.1:8005", member]
+    tick2 = run(nodes=[*CLUSTER, "127.0.0.1:8004", "127.0.0.1:8005", member],
+                probe=list(tick1["probe"]), answers=[])
+    assert tick2["probe"][-1] == "127.0.0.1:8007"
+    assert tick2["nodes"].count(member) == 1, "the member card must not be re-adopted"
+
+
+def test_the_ladder_is_capped_at_the_provision_ceiling():
+    """An answering 8012 (the last provisionable port; RAFT_PROVISION_MAX defaults to
+    12) must not earn a knock on 8013 — the probe list's bounded-forever promise."""
+    got = run(nodes=list(CLUSTER), probe=["127.0.0.1:8012"], answers=["127.0.0.1:8012"])
+    assert got["probe"] == ["127.0.0.1:8012"]
+    assert got["nodes"] == [*CLUSTER, "127.0.0.1:8012"]

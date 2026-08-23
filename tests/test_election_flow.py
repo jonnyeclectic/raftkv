@@ -202,3 +202,46 @@ async def test_follower_does_not_campaign_before_the_timer_expires(make_node):
         assert node.current_term == 0
     finally:
         task.cancel()
+
+
+async def test_a_stale_match_index_at_the_noop_index_does_not_commit(make_node):
+    """A re-elected leader must not count a PRIOR tenure's matchIndex when it commits its
+    no-op. This is a real State Machine Safety bug, reproduced live before it was fixed
+    (docs/FAILURE_MODES.md table 1c), not a defensive hypothetical.
+
+    `_become_leader` appends its no-op, which runs `_advance_commit_index`. If matchIndex
+    were reinitialized AFTER that append, the scan would run against values left over from
+    a previous term. It is NOT enough that those stale values usually point below the
+    no-op and die on the §5.4.2 current-term guard: a leader deposed with
+    `matchIndex[p]=k`, whose own log is then truncated and refilled to length `k-1` — which
+    §5.4.1's term-first vote positively allows, since a node still holding the old prefix
+    can elect a leader whose shorter, higher-term log conflicts with it — appends its
+    no-op at exactly index `k`. `term_at(k)` is now the no-op's current term, the guard
+    passes, and the stale `k`s are counted as replicas of an entry only THIS node holds.
+
+    The setup below is that end state in miniature: the no-op lands at index 4, and both
+    peers carry a stale `matchIndex` of exactly 4. On the buggy ordering the scan commits
+    index 4 on nobody's real acknowledgement; the fix reinitializes matchIndex to 0 BEFORE
+    the append, so there is nothing stale for the scan to count.
+    """
+    node = make_node()  # node-1, voters {node-1, node-2, node-3}, quorum 2
+    node.storage.append([entry(2, "a"), entry(2, "b"), entry(2, "c")])  # log length 3
+    node.current_term = 5  # elected afresh, later term; the no-op will land at index 4
+    node.commit_index = 0
+    # A previous tenure's tally, pointing at exactly where the no-op will be appended.
+    # Under a 3-voter quorum either peer alone is already a majority with us.
+    node.match_index = {"node-2": 4, "node-3": 4}
+    node.next_index = {"node-2": 5, "node-3": 5}
+
+    node._become_leader()
+
+    assert node.storage.entry(4).term == 5  # the no-op, index 4, our term
+    assert node.commit_index == 0, (
+        "committed the no-op on a previous tenure's matchIndex — the peers hold no such "
+        "entry; this is the State Machine Safety violation"
+    )
+    # Figure 2, "Volatile state on leaders (Reinitialized after election)": matchIndex 0
+    # for every peer. next_index is the post-no-op last index + 1 (index 5), unchanged by
+    # this fix — the fix is only that matchIndex is zeroed BEFORE the no-op's commit scan.
+    assert node.match_index == {"node-2": 0, "node-3": 0}
+    assert node.next_index == {"node-2": 5, "node-3": 5}

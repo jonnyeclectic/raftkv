@@ -1,3 +1,37 @@
+# The dashboard's `provision node` button, k8s edition. On this deployment the button
+# does NOT spawn a process (a child would share the pod's network namespace — see
+# provision.py); it PATCHes this StatefulSet's scale subresource through the API server,
+# authenticated as this ServiceAccount. The Role below is the entire blast radius:
+# get/patch on the scale of the one named StatefulSet, nothing else — no pod exec, no
+# secret reads, no deletes. See src/raftkv/k8s_provision.py for the code it authorizes.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: raftkv-provisioner
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: raftkv-provisioner
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets/scale"]
+    resourceNames: ["node"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: raftkv-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: raftkv-provisioner
+    namespace: default   # where `kubectl apply -f` with no -n puts everything above
+roleRef:
+  kind: Role
+  name: raftkv-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -10,14 +44,22 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: raftkv
+  name: node
 spec:
   serviceName: raftkv-hl
+  # Pods are node-1..node-N rather than the default <name>-0..N-1, so k8s node ids match
+  # the compose/run-local convention and `make k8s-forward` maps node-N ↔ 800N.
+  # `ordinals.start` is stable since k8s 1.31; the Makefile pins kind at v1.33.1.
+  ordinals: { start: 1 }
   replicas: 3
   selector: { matchLabels: { app: raftkv } }
   template:
     metadata: { labels: { app: raftkv } }
     spec:
+      # The identity the provision button acts as; its permissions are exactly the
+      # raftkv-provisioner Role above. The token mount this brings is also one half of
+      # k8s_provision.py's "demonstrably a pod" check.
+      serviceAccountName: raftkv-provisioner
       securityContext:
         fsGroup: 1000        # PVC + emptyDir mounts group-writable (gid 1000 = image 'raft' group);
                              # kind's 0777 provisioner hides this, real clusters don't
@@ -40,12 +82,25 @@ spec:
           env:
             - name: POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
-            # The BOOTSTRAP size, deliberately not `replicas`. Pods 0..N-1 form the
+            # The BOOTSTRAP size, deliberately not `replicas`. Pods 1..N form the
             # initial cluster; every pod above that is a scale-out. Leave this at 3
             # when you scale the StatefulSet -- raising it would hand a running
             # cluster a second, conflicting idea of who votes.
             - name: RAFT_BOOTSTRAP
               value: "3"
+            # The provision button works here too, but through the orchestrator, not
+            # through process spawning (which provision.py refuses inside a pod anyway:
+            # a child would share this pod's network namespace and be unreachable from
+            # its peers). RAFT_PROVISION_K8S swaps the backend: the endpoint PATCHes
+            # this StatefulSet's scale subresource as the raftkv-provisioner
+            # ServiceAccount — the same verb as `make k8s-scale`, authenticated and
+            # RBAC-bounded by the Role at the top of this file. Explicit opt-in, never
+            # runtime-detected; the backend refuses anywhere that is not demonstrably a
+            # pod (see k8s_provision.py).
+            - name: RAFT_PROVISION_ENABLED
+              value: "1"
+            - name: RAFT_PROVISION_K8S
+              value: "1"
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -55,7 +110,7 @@ spec:
               # a later-joined member holding a voter it can never dial.
               export RAFT_ADVERTISE="$POD_NAME.raftkv-hl:8000"
               ORD="${POD_NAME##*-}"
-              if [ "$ORD" -ge "$RAFT_BOOTSTRAP" ]; then
+              if [ "$ORD" -gt "$RAFT_BOOTSTRAP" ]; then
                 # `kubectl scale` created this pod. A replica is a PROCESS, not a
                 # cluster member: membership is a configuration entry in the
                 # replicated log (§6), so this pod starts with no peers, never
@@ -65,9 +120,9 @@ spec:
                 export RAFT_LEARNER=1
               else
                 PEERS=""
-                i=0
-                while [ "$i" -lt "$RAFT_BOOTSTRAP" ]; do
-                  NAME="raftkv-$i"
+                i=1
+                while [ "$i" -le "$RAFT_BOOTSTRAP" ]; do
+                  NAME="node-$i"
                   if [ "$NAME" != "$POD_NAME" ]; then
                     PEERS="${PEERS:+$PEERS,}$NAME=$NAME.raftkv-hl:8000"
                   fi
@@ -88,13 +143,23 @@ spec:
           # has died needs RESTARTING, not just removing from the Service: it keeps
           # heartbeating, so no follower can elect around it, and the cluster stays wedged
           # behind a member that is present and useless. Without a livenessProbe nothing
-          # ever restarts that pod.
+          # ever restarts that pod. That is exactly what /livez reports.
+          #
+          # NOT /healthz, which readiness reads. The two endpoints answer different
+          # questions: /healthz answers "treat as serving?" — so it 503s during a
+          # simulated crash, and a killed node SHOULD go NotReady and look down to the
+          # demo — while /livez answers "beyond self-repair?", and a simulated crash is
+          # recoverable by /admin/recover alone. Liveness pointed at /healthz turned the
+          # dashboard's kill button into a ~30s self-resurrection: 3 x 10s of failed
+          # probes, kubelet restart, and the fresh process boots with crashed=False —
+          # un-killed with no admin action. A REALLY dead process fails /livez anyway,
+          # by refusing the connection; only the deliberate crash is exempted.
           #
           # Deliberately slacker than readiness. Taking a node out of rotation is cheap and
           # reversible; killing it costs an election, so it should take sustained failure —
           # 3 x 10s here versus 3 x 5s above.
           livenessProbe:
-            httpGet: { path: /healthz, port: 8000 }
+            httpGet: { path: /livez, port: 8000 }
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
